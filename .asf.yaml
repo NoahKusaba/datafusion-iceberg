@@ -15,6 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# This file controls the settings of this repository
+#
+# See more details at
+# https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
+
 notifications:
   commits: commits@datafusion.apache.org
   issues: github@datafusion.apache.org
@@ -22,11 +27,18 @@ notifications:
   jira_options: link label worklog
 github:
   description: "Apache DataFusion Iceberg Integration"
-  homepage: https://datafusion.apache.org
+  homepage: https://datafusion.apache.org/
   enabled_merge_buttons:
     squash: true
     merge: false
     rebase: true
+  labels:
+    - arrow
+    - datafusion
+    - iceberg
+    - rust
+    - sql
+    - query-engine
   features:
     issues: true
   protected_branches:
