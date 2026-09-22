@@ -186,10 +186,12 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
                 writer.write(batch).await
             }
             SupportedWriter::Fanout(writer) => {
-                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch).await
+                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch)
+                    .await
             }
             SupportedWriter::Clustered(writer) => {
-                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch).await
+                Self::write_partitioned_batches(writer, &self.partition_splitter, &batch)
+                    .await
             }
         }
     }
@@ -264,11 +266,15 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
+    use datafusion::arrow::array::{
+        ArrayRef, Int32Array, RecordBatch, StringArray, StructArray,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use iceberg::arrow::PROJECTED_PARTITION_VALUE_COLUMN;
     use iceberg::io::FileIO;
-    use iceberg::spec::{DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Type};
+    use iceberg::spec::{
+        DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Type,
+    };
     use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use iceberg::writer::file_writer::ParquetWriterBuilder;
     use iceberg::writer::file_writer::location_generator::{
@@ -286,10 +292,20 @@ mod tests {
             iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                    NestedField::required(3, "region", Type::Primitive(PrimitiveType::String))
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
                         .into(),
+                    NestedField::required(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(
+                        3,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
                 ])
                 .build()?,
         ))
@@ -353,8 +369,11 @@ mod tests {
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
-        let file_name_gen =
-            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let file_name_gen = DefaultFileNameGenerator::new(
+            "test".to_string(),
+            None,
+            DataFileFormat::Parquet,
+        );
         let parquet_writer_builder =
             ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
         let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
@@ -376,14 +395,18 @@ mod tests {
         let partition_spec = Arc::new(PartitionSpec::builder(schema.clone()).build()?);
 
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
-        let mut task_writer = TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
+        let mut task_writer =
+            TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
 
         // Write data
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-            Arc::new(StringArray::from(vec!["US", "EU", "US"])),
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+                Arc::new(StringArray::from(vec!["US", "EU", "US"])),
+            ],
+        )?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
@@ -417,7 +440,8 @@ mod tests {
                 _ => panic!("Expected string partition value"),
             };
 
-            *partition_counts.entry(region.clone()).or_insert(0) += data_file.record_count();
+            *partition_counts.entry(region.clone()).or_insert(0) +=
+                data_file.record_count();
 
             // Verify file path contains partition information
             assert!(
@@ -437,12 +461,17 @@ mod tests {
         let partition_spec = Arc::new(
             PartitionSpec::builder(schema.clone())
                 .with_spec_id(1)
-                .add_partition_field("region", "region", iceberg::spec::Transform::Identity)?
+                .add_partition_field(
+                    "region",
+                    "region",
+                    iceberg::spec::Transform::Identity,
+                )?
                 .build()?,
         );
 
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
-        let mut task_writer = TaskWriter::try_new(writer_builder, true, schema, partition_spec)?;
+        let mut task_writer =
+            TaskWriter::try_new(writer_builder, true, schema, partition_spec)?;
 
         // Create partition column
         let partition_field = Field::new("region", DataType::Utf8, false).with_metadata(
@@ -454,12 +483,15 @@ mod tests {
             Arc::new(partition_values) as ArrayRef,
         )]);
 
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])),
-            Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])),
-            Arc::new(partition_struct),
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])),
+                Arc::new(StringArray::from(vec!["US", "EU", "US", "EU"])),
+                Arc::new(partition_struct),
+            ],
+        )?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
@@ -480,12 +512,17 @@ mod tests {
         let partition_spec = Arc::new(
             PartitionSpec::builder(schema.clone())
                 .with_spec_id(1)
-                .add_partition_field("region", "region", iceberg::spec::Transform::Identity)?
+                .add_partition_field(
+                    "region",
+                    "region",
+                    iceberg::spec::Transform::Identity,
+                )?
                 .build()?,
         );
 
         let writer_builder = create_writer_builder(&temp_dir, schema.clone())?;
-        let mut task_writer = TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
+        let mut task_writer =
+            TaskWriter::try_new(writer_builder, false, schema, partition_spec)?;
 
         // Create partition column
         let partition_field = Field::new("region", DataType::Utf8, false).with_metadata(
@@ -498,12 +535,15 @@ mod tests {
         )]);
 
         // ClusteredWriter expects data to be pre-sorted by partition
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])),
-            Arc::new(StringArray::from(vec!["ASIA", "ASIA", "EU", "EU"])),
-            Arc::new(partition_struct),
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Dave"])),
+                Arc::new(StringArray::from(vec!["ASIA", "ASIA", "EU", "EU"])),
+                Arc::new(partition_struct),
+            ],
+        )?;
 
         task_writer.write(batch).await?;
         let data_files = task_writer.close().await?;
