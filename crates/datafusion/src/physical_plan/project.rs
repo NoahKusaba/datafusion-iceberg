@@ -31,7 +31,7 @@ use iceberg::arrow::{
     PROJECTED_PARTITION_VALUE_COLUMN, PartitionValueCalculator, schema_to_arrow_schema,
     strip_metadata_from_schema,
 };
-use iceberg::spec::PartitionSpec;
+use iceberg::spec::{PartitionSpec, SchemaRef as IcebergSchemaRef};
 use iceberg::table::Table;
 
 use crate::to_datafusion_error;
@@ -80,10 +80,6 @@ pub fn project_with_partition(
         );
     }
 
-    let calculator =
-        PartitionValueCalculator::try_new(partition_spec.as_ref(), table_schema.as_ref())
-            .map_err(to_datafusion_error)?;
-
     let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
         Vec::with_capacity(input_schema.fields().len() + 1);
 
@@ -92,7 +88,10 @@ pub fn project_with_partition(
         projection_exprs.push((column_expr, field.name().clone()));
     }
 
-    let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec.clone()));
+    let partition_expr = Arc::new(PartitionExpr::try_new(
+        partition_spec.clone(),
+        table_schema.clone(),
+    )?);
     projection_exprs.push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
     let projection = ProjectionExec::try_new(projection_exprs, input)?;
@@ -100,30 +99,92 @@ pub fn project_with_partition(
 }
 
 /// PhysicalExpr implementation for partition value calculation
+///
+/// The [`PartitionValueCalculator`] cannot be serialized, so the spec and schema it
+/// was built from are retained for [`Self::try_new`] to rebuild from.
 #[derive(Debug, Clone)]
-struct PartitionExpr {
+pub struct PartitionExpr {
     calculator: Arc<PartitionValueCalculator>,
     partition_spec: Arc<PartitionSpec>,
+    table_schema: IcebergSchemaRef,
 }
 
 impl PartitionExpr {
-    fn new(
-        calculator: PartitionValueCalculator,
+    /// Builds the expression from the spec and schema that define it.
+    ///
+    /// The calculator is built here rather than passed in, so it cannot drift from
+    /// the retained inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the spec is unpartitioned or cannot be bound to the schema.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use datafusion_iceberg::physical_plan::PartitionExpr;
+    /// use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
+    ///
+    /// let schema = Arc::new(
+    ///     Schema::builder()
+    ///         .with_fields(vec![
+    ///             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    ///         ])
+    ///         .build()?,
+    /// );
+    /// let spec = Arc::new(
+    ///     PartitionSpec::builder(schema.clone())
+    ///         .add_partition_field("id", "id_bucket", Transform::Bucket(16))?
+    ///         .build()?,
+    /// );
+    /// let expr = PartitionExpr::try_new(spec, schema)?;
+    ///
+    /// // A worker rebuilds an equal expression from the two retained inputs.
+    /// let rebuilt = PartitionExpr::try_new(
+    ///     Arc::new(expr.partition_spec().as_ref().clone()),
+    ///     Arc::new(expr.table_schema().as_ref().clone()),
+    /// )?;
+    /// assert_eq!(expr, rebuilt);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn try_new(
         partition_spec: Arc<PartitionSpec>,
-    ) -> Self {
-        Self {
+        table_schema: IcebergSchemaRef,
+    ) -> Result<Self> {
+        let calculator = PartitionValueCalculator::try_new(
+            partition_spec.as_ref(),
+            table_schema.as_ref(),
+        )
+        .map_err(to_datafusion_error)?;
+        Ok(Self {
             calculator: Arc::new(calculator),
             partition_spec,
-        }
+            table_schema,
+        })
+    }
+
+    /// The partition spec this expression computes values for. With
+    /// [`Self::table_schema`], all [`Self::try_new`] needs to rebuild an equal one.
+    pub fn partition_spec(&self) -> &Arc<PartitionSpec> {
+        &self.partition_spec
+    }
+
+    /// The table schema the spec is bound to. Needed to rebuild: the spec refers to
+    /// columns by `source_id`, and only the schema resolves those.
+    pub fn table_schema(&self) -> &IcebergSchemaRef {
+        &self.table_schema
     }
 }
 
-// Manual PartialEq/Eq implementations for pointer-based equality
-// (two PartitionExpr are equal if they share the same calculator and partition_spec instances)
+// Equal when the spec and schema are equal. The calculator is derived from them, so
+// it takes no part. Both comparisons include `spec_id` and `schema_id`, which `Hash`
+// relies on.
 impl PartialEq for PartitionExpr {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.calculator, &other.calculator)
-            && Arc::ptr_eq(&self.partition_spec, &other.partition_spec)
+        self.partition_spec == other.partition_spec
+            && self.table_schema == other.table_schema
     }
 }
 
@@ -182,14 +243,18 @@ impl std::fmt::Display for PartitionExpr {
 
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Two PartitionExpr are equal if they share the same calculator and partition_spec Arcs
-        Arc::as_ptr(&self.calculator).hash(state);
-        Arc::as_ptr(&self.partition_spec).hash(state);
+        // Neither PartitionSpec nor Schema implements Hash, so hash their ids:
+        // equal expressions agree on both, and collisions fall through to eq.
+        self.partition_spec.spec_id().hash(state);
+        self.table_schema.schema_id().hash(state);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     use datafusion::arrow::array::{ArrayRef, Int32Array, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
@@ -199,6 +264,28 @@ mod tests {
     use iceberg::test_utils::test_runtime;
 
     use super::*;
+
+    fn hash_of(expr: &PartitionExpr) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        expr.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    // `part` typed per caller, so a spec built against one schema can be paired with
+    // a schema that no longer matches it, as happens when a codec rebuilds.
+    fn schema_with_part(part_type: PrimitiveType) -> IcebergSchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "part", Type::Primitive(part_type)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn test_partition_calculator_basic() {
@@ -255,9 +342,6 @@ mod tests {
 
         let input = Arc::new(EmptyExec::new(arrow_schema.clone()));
 
-        let calculator =
-            PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
-
         let mut projection_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
             Vec::with_capacity(arrow_schema.fields().len() + 1);
         for (i, field) in arrow_schema.fields().iter().enumerate() {
@@ -265,7 +349,10 @@ mod tests {
             projection_exprs.push((column_expr, field.name().clone()));
         }
 
-        let partition_expr = Arc::new(PartitionExpr::new(calculator, partition_spec));
+        let partition_expr = Arc::new(
+            PartitionExpr::try_new(partition_spec, Arc::new(table_schema.clone()))
+                .unwrap(),
+        );
         projection_exprs
             .push((partition_expr, PROJECTED_PARTITION_VALUE_COLUMN.to_string()));
 
@@ -317,7 +404,8 @@ mod tests {
         let calculator =
             PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
         let partition_type = calculator.partition_arrow_type().clone();
-        let expr = PartitionExpr::new(calculator, partition_spec);
+        let expr = PartitionExpr::try_new(partition_spec, Arc::new(table_schema.clone()))
+            .unwrap();
 
         assert_eq!(expr.data_type(&arrow_schema).unwrap(), partition_type);
         assert!(!expr.nullable(&arrow_schema).unwrap());
@@ -338,6 +426,173 @@ mod tests {
             }
             _ => panic!("Expected array result"),
         }
+    }
+
+    #[test]
+    fn test_partition_expr_rebuilds_from_its_retained_parts() {
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(table_schema.clone())
+                .add_partition_field("id", "id_partition", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let expr = PartitionExpr::try_new(partition_spec, table_schema).unwrap();
+
+        // Rebuild from deep copies, as a codec would; cloning the Arcs instead
+        // would let a pointer-based impl pass.
+        let rebuilt = PartitionExpr::try_new(
+            Arc::new(expr.partition_spec().as_ref().clone()),
+            Arc::new(expr.table_schema().as_ref().clone()),
+        )
+        .unwrap();
+
+        let eval = |e: &PartitionExpr| match e.evaluate(&batch).unwrap() {
+            ColumnarValue::Array(array) => array,
+            _ => panic!("Expected array result"),
+        };
+        assert_eq!(&eval(&rebuilt), &eval(&expr));
+
+        // Same values is not enough: it must also compare and hash as the same
+        // expression, or plan-level equality and dedup treat the two as unrelated.
+        assert_eq!(rebuilt, expr);
+        assert_eq!(hash_of(&rebuilt), hash_of(&expr));
+    }
+
+    #[test]
+    fn test_try_new_error_paths() {
+        let int_schema = schema_with_part(PrimitiveType::Int);
+        let on_part = |transform| {
+            Arc::new(
+                PartitionSpec::builder(int_schema.clone())
+                    .add_partition_field("part", "p", transform)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let without_part = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // try_new takes the spec and schema separately, so a codec can pair two that
+        // do not fit. project_with_partition reaches none of these: it returns early
+        // when unpartitioned and reads both from the same table metadata.
+        let cases = [
+            (
+                Arc::new(PartitionSpec::builder(int_schema.clone()).build().unwrap()),
+                int_schema.clone(),
+                "unpartitioned",
+            ),
+            (
+                on_part(Transform::Identity),
+                without_part,
+                "Field not found",
+            ),
+            (
+                on_part(Transform::Bucket(4)),
+                schema_with_part(PrimitiveType::Boolean),
+                "not a valid input type of bucket transform",
+            ),
+        ];
+
+        for (spec, schema, expected) in cases {
+            let err = PartitionExpr::try_new(spec, schema)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "expected {expected:?}, got {err}");
+        }
+    }
+
+    #[test]
+    fn test_partition_expr_equality_is_value_based() {
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(2, "part", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let spec = |spec_id: i32, source: &str| {
+            Arc::new(
+                PartitionSpec::builder(table_schema.clone())
+                    .with_spec_id(spec_id)
+                    .add_partition_field(source, "p", Transform::Identity)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let expr = |spec| PartitionExpr::try_new(spec, table_schema.clone()).unwrap();
+
+        // The same inputs describe the same expression.
+        assert_eq!(expr(spec(1, "id")), expr(spec(1, "id")));
+
+        // Genuinely different specs stay apart.
+        assert_ne!(expr(spec(1, "id")), expr(spec(2, "part")));
+
+        // Same spec_id, different partition column: comparing only the ids that
+        // Hash uses would wrongly call these equal.
+        assert_ne!(expr(spec(7, "id")), expr(spec(7, "part")));
+    }
+
+    #[test]
+    fn test_partition_expr_differs_on_schema_with_shared_id() {
+        // Two tables can both be on schema 0 with `part` typed differently, which
+        // changes the partition type. The ids Hash uses are identical here, so only
+        // the struct comparison in eq separates these. Narrowing eq to those ids
+        // would wrongly call them equal.
+        let int_schema = schema_with_part(PrimitiveType::Int);
+        let long_schema = schema_with_part(PrimitiveType::Long);
+        let shared = Arc::new(
+            PartitionSpec::builder(int_schema.clone())
+                .add_partition_field("part", "p", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        let on_int = PartitionExpr::try_new(shared.clone(), int_schema).unwrap();
+        let on_long = PartitionExpr::try_new(shared, long_schema).unwrap();
+
+        assert_eq!(
+            on_int.table_schema().schema_id(),
+            on_long.table_schema().schema_id()
+        );
+        assert_ne!(on_int, on_long);
     }
 
     #[test]
