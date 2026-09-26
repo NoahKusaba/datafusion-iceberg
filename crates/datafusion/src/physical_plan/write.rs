@@ -58,7 +58,7 @@ use crate::to_datafusion_error;
 /// The output of this execution plan is a record batch containing a single column with serialized
 /// data file information that can be used for committing the write operation to the table.
 #[derive(Debug)]
-pub(crate) struct IcebergWriteExec {
+pub struct IcebergWriteExec {
     table: Table,
     input: Arc<dyn ExecutionPlan>,
     result_schema: ArrowSchemaRef,
@@ -66,6 +66,8 @@ pub(crate) struct IcebergWriteExec {
 }
 
 impl IcebergWriteExec {
+    /// Writes the rows of `input` to data files of `table`, without committing
+    /// them; see [`IcebergCommitExec`](super::IcebergCommitExec).
     pub fn new(table: Table, input: Arc<dyn ExecutionPlan>) -> Self {
         let plan_properties =
             Self::compute_properties(&input, Self::make_result_schema());
@@ -76,6 +78,11 @@ impl IcebergWriteExec {
             result_schema: Self::make_result_schema(),
             plan_properties,
         }
+    }
+
+    /// The table this node writes to.
+    pub fn table(&self) -> &Table {
+        &self.table
     }
 
     fn compute_properties(

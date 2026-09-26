@@ -64,23 +64,53 @@ impl IcebergTableScan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Self {
-        let output_schema = match projection {
-            None => schema.clone(),
-            Some(projection) => Arc::new(schema.project(projection).unwrap()),
-        };
-        let plan_properties = Self::compute_properties(output_schema.clone());
-        let projection = get_column_names(schema.clone(), projection);
-        let predicates = convert_filters_to_predicate(filters);
+    ) -> Result<Self> {
+        Self::new_with_predicate(
+            table,
+            snapshot_id,
+            schema,
+            projection,
+            convert_filters_to_predicate(filters),
+            limit,
+        )
+    }
 
-        Self {
+    /// Creates a scan that pushes down an already-converted [`Predicate`]
+    /// rather than DataFusion filters, e.g. one deserialized when the scan is
+    /// rebuilt on a remote worker, so file pruning is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `projection` holds an index outside `schema`.
+    pub fn new_with_predicate(
+        table: Table,
+        snapshot_id: Option<i64>,
+        schema: ArrowSchemaRef,
+        projection: Option<&Vec<usize>>,
+        predicate: Option<Predicate>,
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        let output_schema = match projection {
+            None => schema,
+            Some(projection) => Arc::new(schema.project(projection)?),
+        };
+        let projection = projection.map(|_| {
+            output_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        });
+        let plan_properties = Self::compute_properties(output_schema);
+
+        Ok(Self {
             table,
             snapshot_id,
             plan_properties,
             projection,
-            predicates,
+            predicates: predicate,
             limit,
-        }
+        })
     }
 
     pub fn table(&self) -> &Table {
@@ -238,15 +268,4 @@ async fn get_batch_stream(
         .map_err(to_datafusion_error)?
         .map_err(to_datafusion_error);
     Ok(Box::pin(stream))
-}
-
-fn get_column_names(
-    schema: ArrowSchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> Option<Vec<String>> {
-    projection.map(|v| {
-        v.iter()
-            .map(|p| schema.field(*p).name().clone())
-            .collect::<Vec<String>>()
-    })
 }

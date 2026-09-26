@@ -46,7 +46,7 @@ use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use metadata_table::IcebergMetadataTableProvider;
+pub use metadata_table::IcebergMetadataTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
@@ -79,7 +79,12 @@ impl IcebergTableProvider {
     ///
     /// Loads the table once to get the initial schema, then stores the catalog
     /// reference for future metadata refreshes on each operation.
-    pub(crate) async fn try_new(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot load the table, or its schema has
+    /// no Arrow equivalent.
+    pub async fn try_new(
         catalog: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
@@ -96,11 +101,88 @@ impl IcebergTableProvider {
                 .map_err(to_datafusion_error)?,
         );
 
-        Ok(IcebergTableProvider {
+        Ok(Self::new_with_schema(catalog, table_ident, schema))
+    }
+
+    /// Creates a catalog-backed table provider with a known schema, without
+    /// loading the table.
+    ///
+    /// For rebuilding a provider elsewhere, such as on a distributed engine's
+    /// scheduler, from the parts of one built with [`Self::try_new`]: pass its
+    /// [`table_ident`](Self::table_ident) and [`schema`](TableProvider::schema).
+    /// The rebuilt provider then plans exactly as the original does, including
+    /// when the table's schema has changed since the original was built.
+    ///
+    /// `schema` should be a schema of the table: scans select their columns
+    /// from the table by name.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// use datafusion::catalog::TableProvider;
+    /// use datafusion_iceberg::IcebergTableProvider;
+    /// use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    /// use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    /// use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let warehouse = tempfile::tempdir()?;
+    /// # let props = HashMap::from([(
+    /// #     MEMORY_CATALOG_WAREHOUSE.to_string(),
+    /// #     warehouse.path().display().to_string(),
+    /// # )]);
+    /// let catalog: Arc<dyn Catalog> =
+    ///     Arc::new(MemoryCatalogBuilder::default().load("memory", props).await?);
+    /// let namespace = NamespaceIdent::new("ns".to_string());
+    /// catalog.create_namespace(&namespace, HashMap::new()).await?;
+    /// let schema = Schema::builder()
+    ///     .with_fields(vec![
+    ///         NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+    ///     ])
+    ///     .build()?;
+    /// let creation = TableCreation::builder()
+    ///     .name("t".to_string())
+    ///     .schema(schema)
+    ///     .build();
+    /// catalog.create_table(&namespace, creation).await?;
+    ///
+    /// let original = IcebergTableProvider::try_new(catalog.clone(), namespace, "t").await?;
+    ///
+    /// // Elsewhere, rebuild an equivalent provider from the original's parts,
+    /// // without loading the table again.
+    /// let rebuilt = IcebergTableProvider::new_with_schema(
+    ///     catalog,
+    ///     original.table_ident().clone(),
+    ///     original.schema(),
+    /// );
+    /// assert_eq!(rebuilt.schema(), original.schema());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_schema(
+        catalog: Arc<dyn Catalog>,
+        table_ident: TableIdent,
+        schema: ArrowSchemaRef,
+    ) -> Self {
+        IcebergTableProvider {
             catalog,
             table_ident,
             schema,
-        })
+        }
+    }
+
+    /// The catalog this provider loads its table from and commits through.
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// The identifier of the table this provider reads and writes.
+    pub fn table_ident(&self) -> &TableIdent {
+        &self.table_ident
     }
 
     pub(crate) async fn metadata_table(
@@ -113,7 +195,7 @@ impl IcebergTableProvider {
             .load_table(&self.table_ident)
             .await
             .map_err(to_datafusion_error)?;
-        Ok(IcebergMetadataTableProvider { table, r#type })
+        Ok(IcebergMetadataTableProvider::new(table, r#type))
     }
 }
 
@@ -149,7 +231,7 @@ impl TableProvider for IcebergTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
@@ -295,6 +377,17 @@ impl IcebergStaticTableProvider {
             schema,
         })
     }
+
+    /// The table as loaded when this provider was built.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// The snapshot this provider reads, or `None` for the current snapshot of
+    /// [`Self::table`].
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
 }
 
 #[async_trait]
@@ -322,7 +415,7 @@ impl TableProvider for IcebergStaticTableProvider {
             projection,
             filters,
             limit,
-        )))
+        )?))
     }
 
     fn supports_filters_pushdown(
@@ -351,14 +444,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use datafusion::arrow::array::{Int64Array, UInt64Array};
     use datafusion::common::Column;
     use datafusion::error::DataFusionError;
-    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::execution_plan::{
+        ChildrenPropertiesMode, ReplaceChildrenOptions,
+    };
+    use datafusion::physical_plan::{ExecutionPlan, collect};
     use datafusion::prelude::SessionContext;
     use iceberg::io::FileIO;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::table::{StaticTable, Table};
+    use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
 
@@ -949,5 +1047,213 @@ mod tests {
             None,
             "Limit should be None when not specified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_rejects_out_of_range_projection() {
+        let table = get_test_table_from_metadata_file().await;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+            .await
+            .unwrap();
+        let schema = provider.schema();
+        let out_of_range = schema.fields().len();
+
+        let result = IcebergTableScan::new_with_predicate(
+            table,
+            None,
+            schema,
+            Some(&vec![0, out_of_range]),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    /// Plans an append of an empty input into a catalog-backed provider.
+    async fn plan_insert() -> (IcebergTableProvider, Arc<dyn ExecutionPlan>, TempDir) {
+        let (catalog, namespace, table_name, temp_dir) =
+            get_test_catalog_and_table().await;
+        let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+            provider.schema(),
+        ));
+        let plan = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .unwrap();
+        (provider, plan, temp_dir)
+    }
+
+    /// The commit a provider plans goes through the provider's own catalog, so
+    /// a distributed engine that knows how to rebuild one knows the other.
+    #[tokio::test]
+    async fn test_planned_commit_uses_the_providers_catalog() {
+        let (provider, insert, _temp_dir) = plan_insert().await;
+        let commit = insert.downcast_ref::<IcebergCommitExec>().unwrap();
+        assert!(Arc::ptr_eq(commit.catalog(), provider.catalog()));
+    }
+
+    /// Replacing children must keep the catalog and the commit id, or a
+    /// physical optimizer rule rewriting the plan changes where it commits and
+    /// makes the commit repeatable.
+    #[tokio::test]
+    async fn test_replacing_children_keeps_catalog_and_commit_id() {
+        let (_provider, plan, _temp_dir) = plan_insert().await;
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
+        let rebuilt = Arc::clone(&plan)
+            .replace_children(vec![Arc::clone(plan.children()[0])], recompute)
+            .unwrap();
+        let rebuilt = rebuilt.downcast_ref::<IcebergCommitExec>().unwrap();
+        let original = plan.downcast_ref::<IcebergCommitExec>().unwrap();
+        assert!(Arc::ptr_eq(rebuilt.catalog(), original.catalog()));
+        assert_eq!(rebuilt.commit_id(), original.commit_id());
+    }
+
+    /// A catalog-backed provider registered as `t` in a fresh session, over an
+    /// empty `{id, name}` table.
+    async fn session_with_table()
+    -> (SessionContext, Arc<dyn Catalog>, TableIdent, TempDir) {
+        let (catalog, namespace, table_name, temp_dir) =
+            get_test_catalog_and_table().await;
+        let ident = TableIdent::new(namespace.clone(), table_name.clone());
+        let provider =
+            IcebergTableProvider::try_new(catalog.clone(), namespace, table_name)
+                .await
+                .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+        (ctx, catalog, ident, temp_dir)
+    }
+
+    async fn plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+        ctx.sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// The single `count` an INSERT plan returns.
+    async fn run_insert(ctx: &SessionContext, plan: &Arc<dyn ExecutionPlan>) -> u64 {
+        let batches = collect(Arc::clone(plan), ctx.task_ctx()).await.unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    async fn row_count(ctx: &SessionContext) -> i64 {
+        let batches = ctx
+            .sql("SELECT count(*) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    /// Running one planned INSERT again, as a distributed engine does when it
+    /// retries a failed job, must not append its rows twice.
+    ///
+    /// The rerun writes the rows to new data files (their names are random), so
+    /// the duplicate-file check `fast_append` makes cannot catch it; only the
+    /// commit id recorded in the first commit's snapshot summary can.
+    #[tokio::test]
+    async fn test_rerunning_an_insert_plan_commits_once() {
+        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+        // The retry reports what the committed attempt wrote.
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+
+        assert_eq!(row_count(&ctx).await, 2);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 1);
+    }
+
+    /// The rerun looks for its commit among the snapshots committed since the
+    /// INSERT was planned, not only at the head: here the table had a snapshot
+    /// when it was planned, and another INSERT committed before the rerun.
+    #[tokio::test]
+    async fn test_rerun_finds_its_commit_below_later_snapshots() {
+        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        run_insert(&ctx, &plan(&ctx, "INSERT INTO t VALUES (0, 'z')").await).await;
+        let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+        run_insert(&ctx, &plan(&ctx, "INSERT INTO t VALUES (3, 'c')").await).await;
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+
+        assert_eq!(row_count(&ctx).await, 4);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 3);
+    }
+
+    /// Separately planned INSERTs are separate commits, even with equal rows.
+    #[tokio::test]
+    async fn test_separately_planned_inserts_both_commit() {
+        let (ctx, _catalog, _ident, _temp_dir) = session_with_table().await;
+        for _ in 0..2 {
+            let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
+            assert_eq!(run_insert(&ctx, &insert).await, 1);
+        }
+        assert_eq!(row_count(&ctx).await, 2);
+    }
+
+    /// A provider rebuilt from another's parts plans like the original even
+    /// after the table's schema changes: it keeps the schema the original was
+    /// built with, rather than loading the current one.
+    #[tokio::test]
+    async fn test_provider_rebuilt_with_schema_plans_like_the_original() {
+        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        run_insert(&ctx, &plan(&ctx, "INSERT INTO t VALUES (1, 'a')").await).await;
+        let original = ctx.table_provider("t").await.unwrap();
+        let original = original.downcast_ref::<IcebergTableProvider>().unwrap();
+
+        // The schema changes after the original provider was built.
+        let table = catalog.load_table(&ident).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(
+                "email",
+                Type::Primitive(PrimitiveType::String),
+            ))
+            .apply(tx)
+            .unwrap();
+        tx.commit(catalog.as_ref()).await.unwrap();
+
+        let rebuilt = IcebergTableProvider::new_with_schema(
+            catalog.clone(),
+            original.table_ident().clone(),
+            original.schema(),
+        );
+        assert_eq!(rebuilt.schema(), original.schema());
+
+        let rebuilt_ctx = SessionContext::new();
+        rebuilt_ctx.register_table("t", Arc::new(rebuilt)).unwrap();
+        let query = "SELECT id, name FROM t";
+        let expected = ctx.sql(query).await.unwrap().collect().await.unwrap();
+        let actual = rebuilt_ctx
+            .sql(query)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 }
