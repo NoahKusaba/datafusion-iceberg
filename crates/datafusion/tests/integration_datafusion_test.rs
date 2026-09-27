@@ -1026,6 +1026,14 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .expect("a catalog-backed provider");
     assert_eq!(provider.table_ident(), &ident);
     assert!(Arc::ptr_eq(provider.catalog(), &client));
+    let rebuilt = IcebergTableProvider::try_new(
+        provider.catalog().clone(),
+        provider.table_ident().namespace().clone(),
+        provider.table_ident().name(),
+    )
+    .await?;
+    assert_eq!(rebuilt.table_ident(), &ident);
+    assert_eq!(rebuilt.schema(), provider.schema());
 
     // Write path: a commit above a write, both holding the table, and the
     // commit going through the provider's catalog.
