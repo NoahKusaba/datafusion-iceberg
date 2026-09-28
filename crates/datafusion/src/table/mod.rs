@@ -47,6 +47,7 @@ use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 pub use metadata_table::IcebergMetadataTableProvider;
+use uuid::Uuid;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
@@ -72,6 +73,9 @@ pub struct IcebergTableProvider {
     table_ident: TableIdent,
     /// A reference-counted arrow `Schema` (cached at construction)
     schema: ArrowSchemaRef,
+    /// Whether the INSERTs it plans commit at most once; see
+    /// [`Self::with_idempotent_commits`]
+    idempotent_commits: bool,
 }
 
 impl IcebergTableProvider {
@@ -172,7 +176,19 @@ impl IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            idempotent_commits: false,
         }
+    }
+
+    /// Makes each INSERT this provider plans commit at most once, however
+    /// many times its plan is executed, as a distributed engine that retries
+    /// failed tasks needs. Off by default: the check costs an extra catalog
+    /// load per commit, and without it, executing a plan again commits again.
+    ///
+    /// See [`IcebergCommitExec`] for how the check works and its limits.
+    pub fn with_idempotent_commits(mut self, idempotent_commits: bool) -> Self {
+        self.idempotent_commits = idempotent_commits;
+        self
     }
 
     /// The catalog this provider loads its table from and commits through.
@@ -306,12 +322,17 @@ impl TableProvider for IcebergTableProvider {
         // Merge the outputs of write_plan into one so we can commit all files together
         let coalesce_partitions = Arc::new(CoalescePartitionsExec::new(write_plan));
 
-        Ok(Arc::new(IcebergCommitExec::new(
+        let commit = IcebergCommitExec::new(
             table,
             self.catalog.clone(),
             coalesce_partitions,
             self.schema.clone(),
-        )))
+        );
+        Ok(Arc::new(if self.idempotent_commits {
+            commit.with_commit_id(Uuid::now_v7())
+        } else {
+            commit
+        }))
     }
 }
 
@@ -461,6 +482,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::physical_plan::COMMIT_ID_PROPERTY;
 
     async fn get_test_table_from_metadata_file() -> Table {
         let metadata_file_name = "TableMetadataV2Valid.json";
@@ -1069,13 +1091,15 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Plans an append of an empty input into a catalog-backed provider.
+    /// Plans an append of an empty input into a catalog-backed provider with
+    /// idempotent commits.
     async fn plan_insert() -> (IcebergTableProvider, Arc<dyn ExecutionPlan>, TempDir) {
         let (catalog, namespace, table_name, temp_dir) =
             get_test_catalog_and_table().await;
         let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
             .await
-            .unwrap();
+            .unwrap()
+            .with_idempotent_commits(true);
         let ctx = SessionContext::new();
         let input = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
             provider.schema(),
@@ -1109,20 +1133,26 @@ mod tests {
         let rebuilt = rebuilt.downcast_ref::<IcebergCommitExec>().unwrap();
         let original = plan.downcast_ref::<IcebergCommitExec>().unwrap();
         assert!(Arc::ptr_eq(rebuilt.catalog(), original.catalog()));
+        assert!(original.commit_id().is_some());
         assert_eq!(rebuilt.commit_id(), original.commit_id());
     }
 
     /// A catalog-backed provider registered as `t` in a fresh session, over an
-    /// empty `{id, name}` table.
-    async fn session_with_table()
-    -> (SessionContext, Arc<dyn Catalog>, TableIdent, TempDir) {
+    /// empty `{id, name}` table, with [idempotent commits] when
+    /// `idempotent_commits` is set.
+    ///
+    /// [idempotent commits]: IcebergTableProvider::with_idempotent_commits
+    async fn session_with_table(
+        idempotent_commits: bool,
+    ) -> (SessionContext, Arc<dyn Catalog>, TableIdent, TempDir) {
         let (catalog, namespace, table_name, temp_dir) =
             get_test_catalog_and_table().await;
         let ident = TableIdent::new(namespace.clone(), table_name.clone());
         let provider =
             IcebergTableProvider::try_new(catalog.clone(), namespace, table_name)
                 .await
-                .unwrap();
+                .unwrap()
+                .with_idempotent_commits(idempotent_commits);
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(provider)).unwrap();
         (ctx, catalog, ident, temp_dir)
@@ -1172,7 +1202,7 @@ mod tests {
     /// commit id recorded in the first commit's snapshot summary can.
     #[tokio::test]
     async fn test_rerunning_an_insert_plan_commits_once() {
-        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        let (ctx, catalog, ident, _temp_dir) = session_with_table(true).await;
         let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
 
         assert_eq!(run_insert(&ctx, &insert).await, 2);
@@ -1189,7 +1219,7 @@ mod tests {
     /// when it was planned, and another INSERT committed before the rerun.
     #[tokio::test]
     async fn test_rerun_finds_its_commit_below_later_snapshots() {
-        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        let (ctx, catalog, ident, _temp_dir) = session_with_table(true).await;
         run_insert(&ctx, &plan(&ctx, "INSERT INTO t VALUES (0, 'z')").await).await;
         let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
 
@@ -1202,10 +1232,33 @@ mod tests {
         assert_eq!(table.metadata().snapshots().count(), 3);
     }
 
+    /// Without idempotent commits, the default, running a planned INSERT again
+    /// commits again.
+    #[tokio::test]
+    async fn test_rerunning_an_insert_plan_commits_again_by_default() {
+        let (ctx, catalog, ident, _temp_dir) = session_with_table(false).await;
+        let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a'), (2, 'b')").await;
+        let commit = insert.downcast_ref::<IcebergCommitExec>().unwrap();
+        assert_eq!(commit.commit_id(), None);
+
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+        assert_eq!(run_insert(&ctx, &insert).await, 2);
+
+        assert_eq!(row_count(&ctx).await, 4);
+        let table = catalog.load_table(&ident).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 2);
+        assert!(table.metadata().snapshots().all(|snapshot| {
+            !snapshot
+                .summary()
+                .additional_properties
+                .contains_key(COMMIT_ID_PROPERTY)
+        }));
+    }
+
     /// Separately planned INSERTs are separate commits, even with equal rows.
     #[tokio::test]
     async fn test_separately_planned_inserts_both_commit() {
-        let (ctx, _catalog, _ident, _temp_dir) = session_with_table().await;
+        let (ctx, _catalog, _ident, _temp_dir) = session_with_table(true).await;
         for _ in 0..2 {
             let insert = plan(&ctx, "INSERT INTO t VALUES (1, 'a')").await;
             assert_eq!(run_insert(&ctx, &insert).await, 1);
@@ -1218,7 +1271,7 @@ mod tests {
     /// built with, rather than loading the current one.
     #[tokio::test]
     async fn test_provider_rebuilt_with_schema_plans_like_the_original() {
-        let (ctx, catalog, ident, _temp_dir) = session_with_table().await;
+        let (ctx, catalog, ident, _temp_dir) = session_with_table(false).await;
         run_insert(&ctx, &plan(&ctx, "INSERT INTO t VALUES (1, 'a')").await).await;
         let original = ctx.table_provider("t").await.unwrap();
         let original = original.downcast_ref::<IcebergTableProvider>().unwrap();

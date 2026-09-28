@@ -55,15 +55,16 @@ const ADDED_RECORDS_PROPERTY: &str = "added-records";
 /// IcebergCommitExec is responsible for collecting the files written and use
 /// [`Transaction::fast_append`] to commit the data files written.
 ///
-/// Executing the node more than once commits at most once. Each node has a
-/// [commit id](Self::commit_id), recorded in the summary of the snapshot it
-/// commits. Before committing, it loads the table and looks for that id in the
-/// ancestors of the current snapshot, back to the snapshot the node was planned
-/// against. If an earlier execution already committed, it commits nothing and
-/// reports that execution's row count. A distributed engine that retries a
-/// failed job reruns the writes too, which put the same rows into new data
-/// files, so the duplicate-file check of [`Transaction::fast_append`] would not
-/// catch the repeated commit.
+/// By default, every execution of the node commits. A node given a
+/// [commit id](Self::with_commit_id) instead commits at most once: the id is
+/// recorded in the summary of the snapshot it commits, and before committing,
+/// the node loads the table and looks for that id in the ancestors of the
+/// current snapshot, back to the snapshot the node was planned against. If an
+/// earlier execution already committed, it commits nothing and reports that
+/// execution's row count. A distributed engine that retries a failed job reruns
+/// the writes too, which put the same rows into new data files, so the
+/// duplicate-file check of [`Transaction::fast_append`] would not catch the
+/// repeated commit.
 ///
 /// Two executions running at the same time can both find no earlier commit and
 /// both commit: the check and the commit are separate catalog calls.
@@ -75,8 +76,8 @@ pub struct IcebergCommitExec {
     schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
-    /// Identifies this commit across executions; see [`Self::commit_id`]
-    commit_id: Uuid,
+    /// Identifies this commit across executions, if set; see [`Self::commit_id`]
+    commit_id: Option<Uuid>,
 }
 
 impl IcebergCommitExec {
@@ -99,7 +100,7 @@ impl IcebergCommitExec {
             schema,
             count_schema,
             plan_properties,
-            commit_id: Uuid::now_v7(),
+            commit_id: None,
         }
     }
 
@@ -114,16 +115,18 @@ impl IcebergCommitExec {
     }
 
     /// Identifies this commit, so executing the node again does not commit
-    /// again. A new node gets a new id; a distributed engine that rebuilds the
-    /// node on a remote worker must pass the original on with
-    /// [`Self::with_commit_id`].
-    pub fn commit_id(&self) -> Uuid {
+    /// again, or `None` when every execution commits. A distributed engine
+    /// that rebuilds the node on a remote worker must pass the original on
+    /// with [`Self::with_commit_id`].
+    pub fn commit_id(&self) -> Option<Uuid> {
         self.commit_id
     }
 
-    /// Replaces the [commit id](Self::commit_id).
+    /// Sets the [commit id](Self::commit_id), so that executing the node more
+    /// than once commits at most once, at the cost of loading the table again
+    /// before committing.
     pub fn with_commit_id(mut self, commit_id: Uuid) -> Self {
-        self.commit_id = commit_id;
+        self.commit_id = Some(commit_id);
         self
     }
 
@@ -251,15 +254,14 @@ impl ExecutionPlan for IcebergCommitExec {
             );
         }
 
-        Ok(Arc::new(
-            IcebergCommitExec::new(
-                self.table.clone(),
-                self.catalog.clone(),
-                children[0].clone(),
-                self.schema.clone(),
-            )
-            .with_commit_id(self.commit_id),
-        ))
+        let mut commit = IcebergCommitExec::new(
+            self.table.clone(),
+            self.catalog.clone(),
+            children[0].clone(),
+            self.schema.clone(),
+        );
+        commit.commit_id = self.commit_id;
+        Ok(Arc::new(commit))
     }
 
     fn execute(
@@ -284,7 +286,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         let catalog = Arc::clone(&self.catalog);
         let planned_snapshot = self.table.metadata().current_snapshot_id();
-        let commit_id = self.commit_id.to_string();
+        let commit_id = self.commit_id.map(|id| id.to_string());
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -341,25 +343,26 @@ impl ExecutionPlan for IcebergCommitExec {
                 return Self::make_count_batch(0);
             }
 
-            // An earlier execution of this node may have committed already.
-            let current = catalog
-                .load_table(table.identifier())
-                .await
-                .map_err(to_datafusion_error)?;
-            if let Some(count) =
-                Self::committed_row_count(&current, planned_snapshot, &commit_id)
-            {
-                return Self::make_count_batch(count);
+            let mut snapshot_properties = HashMap::new();
+            if let Some(commit_id) = commit_id {
+                // An earlier execution of this node may have committed already.
+                let current = catalog
+                    .load_table(table.identifier())
+                    .await
+                    .map_err(to_datafusion_error)?;
+                if let Some(count) =
+                    Self::committed_row_count(&current, planned_snapshot, &commit_id)
+                {
+                    return Self::make_count_batch(count);
+                }
+                snapshot_properties.insert(COMMIT_ID_PROPERTY.to_string(), commit_id);
             }
 
             // Create a transaction and commit the data files
             let tx = Transaction::new(&table);
             let action = tx
                 .fast_append()
-                .set_snapshot_properties(HashMap::from([(
-                    COMMIT_ID_PROPERTY.to_string(),
-                    commit_id,
-                )]))
+                .set_snapshot_properties(snapshot_properties)
                 .add_data_files(data_files);
 
             // Apply the action and commit the transaction
