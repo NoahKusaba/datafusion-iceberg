@@ -778,43 +778,104 @@ mod tests {
         assert!(err.contains(INCOMPATIBLE), "{err}");
     }
 
-    #[test]
-    fn test_schema_validation_nested_nullability() {
-        let child = |nullable| Field::new("x", DataType::Int32, nullable);
+    /// Checks the nullability rule for a nested field: `input(nullable)` has a
+    /// required `id` and a column `c` whose nested int is `nullable`, and
+    /// `nested_table(required)` has the matching table column.
+    fn assert_nested_nullability(
+        input: impl Fn(bool) -> DataType,
+        nested_table: impl Fn(bool) -> Type,
+    ) {
         let input = |nullable| {
             input_of(vec![
                 Field::new("id", DataType::Int32, false),
-                Field::new(
-                    "s",
-                    DataType::Struct(Fields::from(vec![child(nullable)])),
-                    false,
-                ),
+                Field::new("c", input(nullable), false),
             ])
         };
-        let table = |x: NestedField| {
+        let table = |required| {
             table_partitioned_by_id(vec![
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
-                NestedField::required(
-                    2,
-                    "s",
-                    Type::Struct(StructType::new(vec![Arc::new(x)])),
-                ),
+                NestedField::required(2, "c", nested_table(required)),
             ])
         };
-        let int = Type::Primitive(PrimitiveType::Int);
 
-        // The same rule applies inside a struct.
-        let optional = table(NestedField::optional(3, "x", int.clone()));
+        let optional = table(false);
         assert!(project_with_partition(input(false), &optional).is_ok());
         assert!(project_with_partition(input(true), &optional).is_ok());
 
-        let required = table(NestedField::required(3, "x", int));
+        let required = table(true);
         assert!(project_with_partition(input(false), &required).is_ok());
         let err = project_with_partition(input(true), &required)
             .unwrap_err()
             .to_string();
         assert!(err.contains(INCOMPATIBLE), "{err}");
     }
+
+    #[test]
+    fn test_schema_validation_struct_nullability() {
+        let int = Type::Primitive(PrimitiveType::Int);
+        assert_nested_nullability(
+            |nullable| {
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "x",
+                    DataType::Int32,
+                    nullable,
+                )]))
+            },
+            |required| {
+                let x = NestedField::new(3, "x", int.clone(), required);
+                Type::Struct(StructType::new(vec![Arc::new(x)]))
+            },
+        );
+    }
+
+    // TODO: enable once iceberg-rust's `strip_metadata_from_schema` handles lists
+    // and maps. It currently fails on any list or map column with "Field stack
+    // underflow", so these error before the schemas are compared.
+    //
+    // #[test]
+    // fn test_schema_validation_list_nullability() {
+    //     use iceberg::spec::{LIST_FIELD_NAME, ListType};
+    //
+    //     let int = Type::Primitive(PrimitiveType::Int);
+    //     assert_nested_nullability(
+    //         |nullable| {
+    //             DataType::List(Arc::new(Field::new(
+    //                 LIST_FIELD_NAME,
+    //                 DataType::Int32,
+    //                 nullable,
+    //             )))
+    //         },
+    //         |required| {
+    //             let element = NestedField::list_element(3, int.clone(), required);
+    //             Type::List(ListType::new(Arc::new(element)))
+    //         },
+    //     );
+    // }
+    //
+    // #[test]
+    // fn test_schema_validation_map_nullability() {
+    //     use iceberg::arrow::DEFAULT_MAP_FIELD_NAME;
+    //     use iceberg::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, MapType};
+    //
+    //     let int = Type::Primitive(PrimitiveType::Int);
+    //     assert_nested_nullability(
+    //         |nullable| {
+    //             let entries = Fields::from(vec![
+    //                 Field::new(MAP_KEY_FIELD_NAME, DataType::Int32, false),
+    //                 Field::new(MAP_VALUE_FIELD_NAME, DataType::Int32, nullable),
+    //             ]);
+    //             let entries =
+    //                 Field::new(DEFAULT_MAP_FIELD_NAME, DataType::Struct(entries), false);
+    //             // Iceberg maps convert to unsorted Arrow maps.
+    //             DataType::Map(Arc::new(entries), false)
+    //         },
+    //         |required| {
+    //             let key = NestedField::map_key_element(3, int.clone());
+    //             let value = NestedField::map_value_element(4, int.clone(), required);
+    //             Type::Map(MapType::new(Arc::new(key), Arc::new(value)))
+    //         },
+    //     );
+    // }
 
     #[test]
     fn test_schema_validation_with_metadata_differences() {
