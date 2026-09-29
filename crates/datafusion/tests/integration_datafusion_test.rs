@@ -28,7 +28,8 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_iceberg::physical_plan::{
     IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
 };
@@ -1036,7 +1037,10 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     assert_eq!(rebuilt.schema(), provider.schema());
 
     // Write path: a commit above a write, both holding the table, and the
-    // commit going through the provider's catalog.
+    // commit going through the provider's catalog. The plan that runs is
+    // rebuilt from their accessors and children alone. The optimizer drops
+    // the coalesce above a single-partition write, so the rebuilt commit
+    // always gets one, as a codec would.
     let insert = ctx
         .sql("INSERT INTO catalog.test_plan_nodes.my_table VALUES (1, 'alan'), (2, 'turing')")
         .await?
@@ -1049,9 +1053,19 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     assert!(Arc::ptr_eq(commit.catalog(), &client));
     let write = find_node::<IcebergWriteExec>(&insert).expect("a write below the commit");
     assert_eq!(write.table().identifier(), &ident);
-    collect(insert, ctx.task_ctx()).await?;
+    let rebuilt_write: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriteExec::new(
+        write.table().clone(),
+        write.children()[0].clone(),
+    ));
+    let rebuilt_commit = IcebergCommitExec::new(
+        commit.table().clone(),
+        commit.catalog().clone(),
+        Arc::new(CoalescePartitionsExec::new(rebuilt_write)),
+    );
+    let inserted = run(&rebuilt_commit, &ctx).await?;
+    assert!(inserted.contains("| 2     |"), "{inserted}");
 
-    // Read path: a scan pinned to a snapshot, rebuilt from its parts,
+    // Read path: a scan pinned to a snapshot, rebuilt from its accessors,
     // returns the same rows.
     let table = client.load_table(&ident).await?;
     let snapshot_id = table.metadata().current_snapshot_id().unwrap();
@@ -1067,29 +1081,37 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .await?;
     let scan = find_node::<IcebergTableScan>(&plan).expect("a scan");
     assert!(scan.predicates().is_some(), "the filter is pushed down");
-    let schema = pinned.schema();
-    let projection = scan
-        .projection()
-        .map(|names| {
-            names
-                .iter()
-                .map(|name| schema.index_of(name))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
     let rebuilt = IcebergTableScan::new_with_predicate(
-        pinned.table().clone(),
+        scan.table().clone(),
         scan.snapshot_id(),
-        schema,
-        projection.as_deref(),
+        scan.schema(),
+        scan.projection().map(<[String]>::to_vec),
         scan.predicates().cloned(),
         scan.limit(),
     )?;
+    assert_eq!(rebuilt.schema(), scan.schema());
     let expected = run(scan, &ctx).await?;
     assert!(
         expected.contains("alan") && !expected.contains("turing"),
         "{expected}"
     );
+    assert_eq!(run(&rebuilt, &ctx).await?, expected);
+
+    // Without a projection the scan reads every column, and its limit is kept.
+    let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
+    let scan = plan.downcast_ref::<IcebergTableScan>().expect("a scan");
+    assert_eq!(scan.projection(), None);
+    let rebuilt = IcebergTableScan::new_with_predicate(
+        scan.table().clone(),
+        scan.snapshot_id(),
+        scan.schema(),
+        scan.projection().map(<[String]>::to_vec),
+        scan.predicates().cloned(),
+        scan.limit(),
+    )?;
+    assert_eq!(rebuilt.limit(), Some(1));
+    let expected = run(scan, &ctx).await?;
+    assert_eq!(expected.lines().count(), 5, "one row:\n{expected}");
     assert_eq!(run(&rebuilt, &ctx).await?, expected);
 
     // Metadata tables: a scan rebuilt from a metadata scan's parts reads the

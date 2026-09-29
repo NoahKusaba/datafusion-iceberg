@@ -21,6 +21,7 @@ use std::vec;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::common::plan_err;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -65,11 +66,23 @@ impl IcebergTableScan {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Self> {
+        let (output_schema, projection) = match projection {
+            None => (schema, None),
+            Some(projection) => {
+                let output_schema = Arc::new(schema.project(projection)?);
+                let names = output_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect();
+                (output_schema, Some(names))
+            }
+        };
         Self::new_with_predicate(
             table,
             snapshot_id,
-            schema,
-            projection.map(Vec::as_slice),
+            output_schema,
+            projection,
             convert_filters_to_predicate(filters),
             limit,
         )
@@ -80,14 +93,17 @@ impl IcebergTableScan {
     /// its parts, such as after sending them to another process. A predicate
     /// cannot be converted back to the filters it came from.
     ///
-    /// The arguments mean what the matching accessors return:
+    /// Each argument takes what the matching accessor returns (`predicate`
+    /// what [`Self::predicates`] does), so a scan is rebuilt from
+    /// [`ExecutionPlan::schema`] and [`Self::projection`]:
     ///
     /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
     ///   snapshot.
-    /// - `schema`: the Arrow schema of the table the scan reads, as its
-    ///   provider reports it.
-    /// - `projection`: indices into `schema` of the columns to read, or `None`
-    ///   for all. The columns are read from the table by name.
+    /// - `schema`: the Arrow schema the scan outputs. With `projection` set,
+    ///   its fields must be the projected columns, in order. Without one, it
+    ///   must be the full schema of the table as read, which is not checked.
+    /// - `projection`: the names of the columns to read from the table, or
+    ///   `None` for all of them.
     /// - `predicate`: pushed down to Iceberg to skip data files and rows. The
     ///   table providers report their filters as
     ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
@@ -95,7 +111,8 @@ impl IcebergTableScan {
     ///
     /// # Errors
     ///
-    /// Returns an error if `projection` holds an index outside `schema`.
+    /// Returns an error if `projection` does not name the fields of `schema`,
+    /// in order.
     ///
     /// # Example
     ///
@@ -137,26 +154,17 @@ impl IcebergTableScan {
     ///     .await?;
     /// let scan = plan.downcast_ref::<IcebergTableScan>().unwrap();
     ///
-    /// // Rebuild an equivalent scan from the original's parts.
-    /// let schema = provider.schema();
-    /// let projection = scan
-    ///     .projection()
-    ///     .map(|names| {
-    ///         names
-    ///             .iter()
-    ///             .map(|name| schema.index_of(name))
-    ///             .collect::<Result<Vec<_>, _>>()
-    ///     })
-    ///     .transpose()?;
+    /// // Rebuild an equivalent scan from the original's accessors alone.
     /// let rebuilt = IcebergTableScan::new_with_predicate(
     ///     scan.table().clone(),
     ///     scan.snapshot_id(),
-    ///     schema,
-    ///     projection.as_deref(),
+    ///     scan.schema(),
+    ///     scan.projection().map(<[String]>::to_vec),
     ///     scan.predicates().cloned(),
     ///     scan.limit(),
     /// )?;
     /// assert_eq!(rebuilt.schema(), scan.schema());
+    /// assert_eq!(rebuilt.projection(), scan.projection());
     /// assert_eq!(rebuilt.predicates(), scan.predicates());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # })?;
@@ -166,23 +174,23 @@ impl IcebergTableScan {
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
-        projection: Option<&[usize]>,
+        projection: Option<Vec<String>>,
         predicate: Option<Predicate>,
         limit: Option<usize>,
     ) -> Result<Self> {
-        let output_schema = match projection {
-            None => schema,
-            Some(projection) => Arc::new(schema.project(projection)?),
-        };
-        // The columns to read, by name; `None` reads them all.
-        let projection = projection.map(|_| {
-            output_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect()
-        });
-        let plan_properties = Self::compute_properties(output_schema);
+        // The scan reads the named columns and reports `schema`, so the two
+        // must agree, or its batches would not match its schema.
+        if let Some(projection) = &projection {
+            let fields: Vec<&String> =
+                schema.fields().iter().map(|field| field.name()).collect();
+            if !projection.iter().eq(fields.iter().copied()) {
+                return plan_err!(
+                    "IcebergTableScan projection {projection:?} does not match the \
+                     fields of its schema {fields:?}"
+                );
+            }
+        }
+        let plan_properties = Self::compute_properties(schema);
 
         Ok(Self {
             table,

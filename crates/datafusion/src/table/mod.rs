@@ -238,7 +238,6 @@ impl TableProvider for IcebergTableProvider {
             table,
             self.catalog.clone(),
             coalesce_partitions,
-            self.schema.clone(),
         )))
     }
 }
@@ -981,15 +980,53 @@ mod tests {
         let schema = provider.schema();
         let out_of_range = schema.fields().len();
 
-        let err = IcebergTableScan::new_with_predicate(
+        let err = IcebergTableScan::new(
             table,
             None,
             schema,
-            Some(&[0, out_of_range]),
-            None,
+            Some(&vec![0, out_of_range]),
+            &[],
             None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("project index"), "{err}");
+    }
+
+    /// A projection that does not name the schema's fields would make the scan
+    /// return batches that do not match its schema, so it is refused.
+    #[tokio::test]
+    async fn test_scan_rejects_projection_not_matching_schema() {
+        let table = get_test_table_from_metadata_file().await;
+        let provider = IcebergStaticTableProvider::try_new_from_table(table.clone())
+            .await
+            .unwrap();
+        let schema = provider.schema();
+        assert!(schema.fields().len() >= 2);
+        let first = schema.field(0).name().clone();
+        let second = schema.field(1).name().clone();
+        let projected = Arc::new(schema.project(&[1]).unwrap());
+
+        let mismatched = [
+            // Names in the wrong order for the schema.
+            (schema.clone(), vec![second.clone(), first.clone()]),
+            // A column the schema does not have.
+            (projected.clone(), vec![first.clone()]),
+            // More columns than the schema has.
+            (projected, vec![first.clone(), second]),
+            // Fewer columns than the schema has.
+            (schema.clone(), vec![first]),
+        ];
+        for (schema, projection) in mismatched {
+            let err = IcebergTableScan::new_with_predicate(
+                table.clone(),
+                None,
+                schema,
+                Some(projection),
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("does not match"), "{err}");
+        }
     }
 }

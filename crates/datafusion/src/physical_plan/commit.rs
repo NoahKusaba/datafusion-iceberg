@@ -53,7 +53,6 @@ pub struct IcebergCommitExec {
     table: Table,
     catalog: Arc<dyn Catalog>,
     input: Arc<dyn ExecutionPlan>,
-    schema: ArrowSchemaRef,
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
 }
@@ -64,13 +63,11 @@ impl IcebergCommitExec {
     /// `input` must have a single partition, such as a
     /// [`CoalescePartitionsExec`](datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec)
     /// over an [`IcebergWriteExec`](super::IcebergWriteExec); executing the node
-    /// fails otherwise. `schema` is the table's Arrow schema, shown in the
-    /// verbose plan display.
+    /// fails otherwise.
     pub fn new(
         table: Table,
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
-        schema: ArrowSchemaRef,
     ) -> Self {
         let count_schema = Self::make_count_schema();
 
@@ -80,7 +77,6 @@ impl IcebergCommitExec {
             table,
             catalog,
             input,
-            schema,
             count_schema,
             plan_properties,
         }
@@ -136,11 +132,22 @@ impl DisplayAs for IcebergCommitExec {
                 write!(f, "IcebergCommitExec: table={}", self.table.identifier())
             }
             DisplayFormatType::Verbose => {
+                // The fields on one line, as `Schema`'s own display spans
+                // several.
+                let fields = self
+                    .table
+                    .metadata()
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| field.to_string().trim_end().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(
                     f,
-                    "IcebergCommitExec: table={}, schema={:?}",
-                    self.table.identifier(),
-                    self.schema
+                    "IcebergCommitExec: table={}, schema=[{fields}]",
+                    self.table.identifier()
                 )
             }
             DisplayFormatType::TreeRender => {
@@ -198,7 +205,6 @@ impl ExecutionPlan for IcebergCommitExec {
             self.table.clone(),
             self.catalog.clone(),
             children[0].clone(),
-            self.schema.clone(),
         )))
     }
 
@@ -519,19 +525,8 @@ mod tests {
         let input_exec =
             Arc::new(MockWriteExec::new(vec![data_file1_json, data_file2_json]));
 
-        // Create the IcebergCommitExec
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            DATA_FILES_COL_NAME,
-            DataType::Utf8,
-            false,
-        )]));
-
-        let commit_exec = IcebergCommitExec::new(
-            table.clone(),
-            catalog.clone(),
-            input_exec,
-            arrow_schema,
-        );
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec);
 
         // Verify Execution Plan schema matches the count schema
         assert_eq!(commit_exec.schema(), IcebergCommitExec::make_count_schema());
@@ -644,14 +639,7 @@ mod tests {
         }
         let input = UnionExec::try_new(partitions)?;
         assert_eq!(input.properties().partitioning.partition_count(), 2);
-
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            DATA_FILES_COL_NAME,
-            DataType::Utf8,
-            false,
-        )]));
-        let commit_exec =
-            IcebergCommitExec::new(table.clone(), catalog.clone(), input, arrow_schema);
+        let commit_exec = IcebergCommitExec::new(table.clone(), catalog.clone(), input);
         let err = match commit_exec.execute(0, Arc::new(TaskContext::default())) {
             Ok(_) => panic!("a commit over two input partitions must not execute"),
             Err(err) => err.to_string(),
@@ -706,16 +694,20 @@ mod tests {
 
         // Mock write plan produces no data files
         let input_exec = Arc::new(MockWriteExec::new(vec![]));
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            DATA_FILES_COL_NAME,
-            DataType::Utf8,
-            false,
-        )]));
-        let commit_exec = IcebergCommitExec::new(
-            table.clone(),
-            catalog.clone(),
-            input_exec,
-            arrow_schema,
+        let commit_exec =
+            IcebergCommitExec::new(table.clone(), catalog.clone(), input_exec);
+
+        // The verbose display shows the table's schema on one line.
+        struct Verbose<'a>(&'a IcebergCommitExec);
+        impl fmt::Display for Verbose<'_> {
+            fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+                self.0.fmt_as(DisplayFormatType::Verbose, f)
+            }
+        }
+        assert_eq!(
+            Verbose(&commit_exec).to_string(),
+            "IcebergCommitExec: table=test_empty_insert.empty_insert_table, \
+             schema=[1: id: required int]"
         );
 
         let task_ctx = Arc::new(TaskContext::default());
