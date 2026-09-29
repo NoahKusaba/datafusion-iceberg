@@ -42,27 +42,6 @@ pub struct IcebergMetadataTableProvider {
     r#type: MetadataTableType,
 }
 
-impl IcebergMetadataTableProvider {
-    /// Creates a provider for the `metadata_type` metadata table of an
-    /// already loaded table.
-    pub fn new(table: Table, metadata_type: MetadataTableType) -> Self {
-        Self {
-            table,
-            r#type: metadata_type,
-        }
-    }
-
-    /// The table whose metadata this provider reads.
-    pub fn table(&self) -> &Table {
-        &self.table
-    }
-
-    /// Which metadata table of [`Self::table`] this provider reads.
-    pub fn metadata_type(&self) -> &MetadataTableType {
-        &self.r#type
-    }
-}
-
 #[async_trait]
 impl TableProvider for IcebergMetadataTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
@@ -91,6 +70,25 @@ impl TableProvider for IcebergMetadataTableProvider {
 }
 
 impl IcebergMetadataTableProvider {
+    /// Creates a provider for the `metadata_type` metadata table of an
+    /// already loaded table.
+    pub fn new(table: Table, metadata_type: MetadataTableType) -> Self {
+        Self {
+            table,
+            r#type: metadata_type,
+        }
+    }
+
+    /// The table whose metadata this provider reads.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Which metadata table of [`Self::table`] this provider reads.
+    pub fn metadata_type(&self) -> &MetadataTableType {
+        &self.r#type
+    }
+
     pub async fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let metadata_table = self.table.inspect();
         let stream = match self.r#type {
