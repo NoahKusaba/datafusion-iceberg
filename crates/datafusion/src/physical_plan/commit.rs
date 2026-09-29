@@ -644,9 +644,10 @@ mod tests {
             Ok(_) => panic!("a commit over two input partitions must not execute"),
             Err(err) => err.to_string(),
         };
-        assert!(
-            err.contains("requires an input with one partition"),
-            "{err}"
+        assert_eq!(
+            err,
+            "Execution error: IcebergCommitExec requires an input with one \
+             partition, but it has 2; coalesce the input first"
         );
 
         let table = catalog.load_table(table.identifier()).await?;

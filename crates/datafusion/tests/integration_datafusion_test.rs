@@ -17,12 +17,15 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+use datafusion::arrow::datatypes::Int64Type;
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
@@ -44,6 +47,7 @@ use iceberg::spec::{
     NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::test_utils::check_record_batches;
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
@@ -988,14 +992,23 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Executes the single partition of `plan` and renders its rows as a table.
+/// Executes `plan`, which must have a single partition, and returns its rows.
+async fn run_batches(
+    plan: &dyn ExecutionPlan,
+    ctx: &SessionContext,
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    let stream = plan.execute(0, ctx.task_ctx())?;
+    Ok(datafusion::physical_plan::common::collect(stream).await?)
+}
+
+/// Executes `plan`, which must have a single partition, and renders its rows
+/// as a table.
 async fn run(
     plan: &dyn ExecutionPlan,
     ctx: &SessionContext,
 ) -> Result<String, Box<dyn Error>> {
-    let stream = plan.execute(0, ctx.task_ctx())?;
-    let batches = datafusion::physical_plan::common::collect(stream).await?;
-    Ok(pretty_format_batches(&batches)?.to_string())
+    Ok(pretty_format_batches(&run_batches(plan, ctx).await?)?.to_string())
 }
 
 /// Returns the first node of type `T` in `plan`, depth first.
@@ -1062,8 +1075,13 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         commit.catalog().clone(),
         Arc::new(CoalescePartitionsExec::new(rebuilt_write)),
     );
-    let inserted = run(&rebuilt_commit, &ctx).await?;
-    assert!(inserted.contains("| 2     |"), "{inserted}");
+    expect![[r#"
+        +-------+
+        | count |
+        +-------+
+        | 2     |
+        +-------+"#]]
+    .assert_eq(&run(&rebuilt_commit, &ctx).await?);
 
     // Read path: a scan pinned to a snapshot, rebuilt from its accessors,
     // returns the same rows.
@@ -1074,45 +1092,92 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
             .await?;
     assert_eq!(pinned.snapshot_id(), Some(snapshot_id));
     ctx.register_table("pinned", Arc::new(pinned.clone()))?;
+    // A later write, so a scan reading the current snapshot rather than the
+    // pinned one would return its row too.
+    ctx.sql("INSERT INTO catalog.test_plan_nodes.my_table VALUES (3, 'hopper')")
+        .await?
+        .collect()
+        .await?;
+    let latest_snapshot_id = client
+        .load_table(&ident)
+        .await?
+        .metadata()
+        .current_snapshot_id()
+        .unwrap();
+    assert_ne!(latest_snapshot_id, snapshot_id);
     let plan = ctx
         .sql("SELECT foo2 FROM pinned WHERE foo1 = 1")
         .await?
         .create_physical_plan()
         .await?;
     let scan = find_node::<IcebergTableScan>(&plan).expect("a scan");
-    assert!(scan.predicates().is_some(), "the filter is pushed down");
+    assert_eq!(
+        scan.predicates().map(ToString::to_string).as_deref(),
+        Some("foo1 = 1")
+    );
     let rebuilt = IcebergTableScan::new_with_predicate(
         scan.table().clone(),
         scan.snapshot_id(),
         scan.schema(),
-        scan.projection().map(<[String]>::to_vec),
         scan.predicates().cloned(),
         scan.limit(),
-    )?;
-    assert_eq!(rebuilt.schema(), scan.schema());
-    let expected = run(scan, &ctx).await?;
-    assert!(
-        expected.contains("alan") && !expected.contains("turing"),
-        "{expected}"
     );
+    assert_eq!(rebuilt.schema(), scan.schema());
+    assert_eq!(rebuilt.projection(), scan.projection());
+    let expected = run(scan, &ctx).await?;
+    expect![[r#"
+        +------+------+
+        | foo1 | foo2 |
+        +------+------+
+        | 1    | alan |
+        +------+------+"#]]
+    .assert_eq(&expected);
     assert_eq!(run(&rebuilt, &ctx).await?, expected);
 
-    // Without a projection the scan reads every column, and its limit is kept.
+    // Without a projection the scan reads every column by name, and its limit
+    // is kept.
     let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
     let scan = plan.downcast_ref::<IcebergTableScan>().expect("a scan");
-    assert_eq!(scan.projection(), None);
+    assert_eq!(
+        scan.projection(),
+        Some(&["foo1".to_string(), "foo2".to_string()][..])
+    );
     let rebuilt = IcebergTableScan::new_with_predicate(
         scan.table().clone(),
         scan.snapshot_id(),
         scan.schema(),
-        scan.projection().map(<[String]>::to_vec),
         scan.predicates().cloned(),
         scan.limit(),
-    )?;
+    );
     assert_eq!(rebuilt.limit(), Some(1));
     let expected = run(scan, &ctx).await?;
-    assert_eq!(expected.lines().count(), 5, "one row:\n{expected}");
+    expect![[r#"
+        +------+------+
+        | foo1 | foo2 |
+        +------+------+
+        | 1    | alan |
+        +------+------+"#]]
+    .assert_eq(&expected);
     assert_eq!(run(&rebuilt, &ctx).await?, expected);
+
+    // A scan reads the columns of its schema and no others, so one built over
+    // part of the table returns only those columns, from the pinned snapshot.
+    let foo2_only = Arc::new(pinned.schema().project(&[1])?);
+    let partial = IcebergTableScan::new_with_predicate(
+        pinned.table().clone(),
+        Some(snapshot_id),
+        foo2_only,
+        None,
+        None,
+    );
+    expect![[r#"
+        +--------+
+        | foo2   |
+        +--------+
+        | alan   |
+        | turing |
+        +--------+"#]]
+    .assert_eq(&run(&partial, &ctx).await?);
 
     // Metadata tables: a scan rebuilt from a metadata scan's parts reads the
     // same rows.
@@ -1128,9 +1193,213 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         provider.table().clone(),
         provider.metadata_type().clone(),
     ));
-    let expected = run(metadata_scan, &ctx).await?;
-    assert!(expected.contains(&snapshot_id.to_string()), "{expected}");
-    assert_eq!(run(&rebuilt, &ctx).await?, expected);
+    let batches = run_batches(metadata_scan, &ctx).await?;
+    // Snapshots come back in no set order, so put the first, which has no
+    // parent, first. Their ids, times and paths differ on every run, so each
+    // row is checked against its snapshot's metadata.
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("parent_id").unwrap(), None, None)?;
+    let batch = take_record_batch(&batch, &order)?;
+    let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+    let longs = |name: &str| -> Result<Vec<Option<i64>>, Box<dyn Error>> {
+        Ok(cast(&column(name), &DataType::Int64)?
+            .as_primitive::<Int64Type>()
+            .iter()
+            .collect())
+    };
+    let strings = |name: &str| -> Vec<Option<String>> {
+        column(name)
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect()
+    };
+    let metadata = provider.table().metadata();
+    let snapshots = [snapshot_id, latest_snapshot_id].map(|id| {
+        metadata
+            .snapshot_by_id(id)
+            .expect("a snapshot of the table")
+    });
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "committed_at",
+            "snapshot_id",
+            "parent_id",
+            "operation",
+            "manifest_list",
+            "summary"
+        ]
+    );
+    assert_eq!(
+        longs("committed_at")?,
+        snapshots.map(|snapshot| Some(snapshot.timestamp_ms() * 1000))
+    );
+    assert_eq!(
+        longs("snapshot_id")?,
+        [Some(snapshot_id), Some(latest_snapshot_id)]
+    );
+    assert_eq!(longs("parent_id")?, [None, Some(snapshot_id)]);
+    assert_eq!(
+        strings("operation"),
+        [Some("append".to_string()), Some("append".to_string())]
+    );
+    assert_eq!(
+        strings("manifest_list"),
+        snapshots.map(|snapshot| Some(snapshot.manifest_list().to_string()))
+    );
+    // The summaries print their keys in no set order, so sort them.
+    let summaries = column("summary");
+    let summaries = summaries.as_map();
+    let summaries = (0..summaries.len())
+        .map(|row| {
+            let entries = summaries.value(row);
+            let keys = entries.column(0).as_string::<i32>();
+            let values = entries.column(1).as_string::<i32>();
+            (0..entries.len())
+                .map(|entry| format!("{}: {}", keys.value(entry), values.value(entry)))
+                .collect::<BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    expect![[r#"
+        [
+            {
+                "added-data-files: 1",
+                "added-files-size: 913",
+                "added-records: 2",
+                "total-data-files: 1",
+                "total-delete-files: 0",
+                "total-equality-deletes: 0",
+                "total-files-size: 913",
+                "total-position-deletes: 0",
+                "total-records: 2",
+            },
+            {
+                "added-data-files: 1",
+                "added-files-size: 901",
+                "added-records: 1",
+                "total-data-files: 2",
+                "total-delete-files: 0",
+                "total-equality-deletes: 0",
+                "total-files-size: 1814",
+                "total-position-deletes: 0",
+                "total-records: 3",
+            },
+        ]
+    "#]]
+    .assert_debug_eq(&summaries);
+    // The rebuilt scan holds the same table, so lists its snapshots in the
+    // same order.
+    assert_eq!(
+        pretty_format_batches(&run_batches(&rebuilt, &ctx).await?)?.to_string(),
+        pretty_format_batches(&batches)?.to_string()
+    );
+
+    Ok(())
+}
+
+/// A catalog-backed provider keeps the schema it was built with, but scans the
+/// table as it is now. After a column is added to the table and written to, a
+/// scan with no projection still returns only the provider's columns, matching
+/// its schema.
+#[tokio::test]
+async fn test_scan_after_schema_evolution_reads_provider_columns()
+-> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_schema_evolution".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
+
+    let provider = Arc::new(
+        IcebergTableProvider::try_new(client.clone(), namespace, "my_table").await?,
+    );
+    let ctx = SessionContext::new();
+    ctx.register_table("t", provider.clone())?;
+    ctx.sql("INSERT INTO t VALUES (1, 'alan')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client.load_table(&ident).await?;
+    let tx = Transaction::new(&table);
+    tx.update_schema()
+        .add_column(AddColumn::optional(
+            "foo3",
+            Type::Primitive(PrimitiveType::Int),
+        ))
+        .apply(tx)?
+        .commit(client.as_ref())
+        .await?;
+
+    // A scan reads the schema of the snapshot it reads, so write a snapshot
+    // with the new column, through a provider that sees it.
+    let evolved = IcebergTableProvider::try_new(
+        client.clone(),
+        ident.namespace().clone(),
+        ident.name(),
+    )
+    .await?;
+    expect![[r#"
+        Schema {
+            fields: [
+                Field {
+                    name: "foo1",
+                    data_type: Int32,
+                    metadata: {
+                        "PARQUET:field_id": "1",
+                    },
+                },
+                Field {
+                    name: "foo2",
+                    data_type: Utf8,
+                    metadata: {
+                        "PARQUET:field_id": "2",
+                    },
+                },
+                Field {
+                    name: "foo3",
+                    data_type: Int32,
+                    nullable: true,
+                    metadata: {
+                        "PARQUET:field_id": "3",
+                    },
+                },
+            ],
+            metadata: {},
+        }
+    "#]]
+    .assert_debug_eq(&evolved.schema());
+    ctx.register_table("evolved", Arc::new(evolved))?;
+    ctx.sql("INSERT INTO evolved VALUES (2, 'turing', 3)")
+        .await?
+        .collect()
+        .await?;
+
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    assert_eq!(plan.schema(), provider.schema());
+    // The rows come from two data files, which may be read in either order.
+    // They are joined under their own schema, not the plan's, so that a column
+    // the plan does not report would show.
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+    let sorted = take_record_batch(&batch, &order)?;
+    expect![[r#"
+        +------+--------+
+        | foo1 | foo2   |
+        +------+--------+
+        | 1    | alan   |
+        | 2    | turing |
+        +------+--------+"#]]
+    .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
 
     Ok(())
 }
