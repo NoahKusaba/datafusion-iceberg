@@ -269,10 +269,12 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Fields};
     use datafusion::physical_plan::empty::EmptyExec;
     use iceberg::TableIdent;
+    use iceberg::arrow::DEFAULT_MAP_FIELD_NAME;
     use iceberg::io::FileIO;
     use iceberg::spec::{
-        FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, StructType,
-        TableMetadataBuilder, Transform, Type,
+        FormatVersion, LIST_FIELD_NAME, ListType, MAP_KEY_FIELD_NAME,
+        MAP_VALUE_FIELD_NAME, MapType, NestedField, PrimitiveType, Schema, SortOrder,
+        StructType, TableMetadataBuilder, Transform, Type,
     };
     use iceberg::test_utils::test_runtime;
 
@@ -828,54 +830,45 @@ mod tests {
         );
     }
 
-    // TODO: enable once iceberg-rust's `strip_metadata_from_schema` handles lists
-    // and maps. It currently fails on any list or map column with "Field stack
-    // underflow", so these error before the schemas are compared.
-    //
-    // #[test]
-    // fn test_schema_validation_list_nullability() {
-    //     use iceberg::spec::{LIST_FIELD_NAME, ListType};
-    //
-    //     let int = Type::Primitive(PrimitiveType::Int);
-    //     assert_nested_nullability(
-    //         |nullable| {
-    //             DataType::List(Arc::new(Field::new(
-    //                 LIST_FIELD_NAME,
-    //                 DataType::Int32,
-    //                 nullable,
-    //             )))
-    //         },
-    //         |required| {
-    //             let element = NestedField::list_element(3, int.clone(), required);
-    //             Type::List(ListType::new(Arc::new(element)))
-    //         },
-    //     );
-    // }
-    //
-    // #[test]
-    // fn test_schema_validation_map_nullability() {
-    //     use iceberg::arrow::DEFAULT_MAP_FIELD_NAME;
-    //     use iceberg::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, MapType};
-    //
-    //     let int = Type::Primitive(PrimitiveType::Int);
-    //     assert_nested_nullability(
-    //         |nullable| {
-    //             let entries = Fields::from(vec![
-    //                 Field::new(MAP_KEY_FIELD_NAME, DataType::Int32, false),
-    //                 Field::new(MAP_VALUE_FIELD_NAME, DataType::Int32, nullable),
-    //             ]);
-    //             let entries =
-    //                 Field::new(DEFAULT_MAP_FIELD_NAME, DataType::Struct(entries), false);
-    //             // Iceberg maps convert to unsorted Arrow maps.
-    //             DataType::Map(Arc::new(entries), false)
-    //         },
-    //         |required| {
-    //             let key = NestedField::map_key_element(3, int.clone());
-    //             let value = NestedField::map_value_element(4, int.clone(), required);
-    //             Type::Map(MapType::new(Arc::new(key), Arc::new(value)))
-    //         },
-    //     );
-    // }
+    #[test]
+    fn test_schema_validation_list_nullability() {
+        let int = Type::Primitive(PrimitiveType::Int);
+        assert_nested_nullability(
+            |nullable| {
+                DataType::List(Arc::new(Field::new(
+                    LIST_FIELD_NAME,
+                    DataType::Int32,
+                    nullable,
+                )))
+            },
+            |required| {
+                let element = NestedField::list_element(3, int.clone(), required);
+                Type::List(ListType::new(Arc::new(element)))
+            },
+        );
+    }
+
+    #[test]
+    fn test_schema_validation_map_nullability() {
+        let int = Type::Primitive(PrimitiveType::Int);
+        assert_nested_nullability(
+            |nullable| {
+                let entries = Fields::from(vec![
+                    Field::new(MAP_KEY_FIELD_NAME, DataType::Int32, false),
+                    Field::new(MAP_VALUE_FIELD_NAME, DataType::Int32, nullable),
+                ]);
+                let entries =
+                    Field::new(DEFAULT_MAP_FIELD_NAME, DataType::Struct(entries), false);
+                // Iceberg maps convert to unsorted Arrow maps.
+                DataType::Map(Arc::new(entries), false)
+            },
+            |required| {
+                let key = NestedField::map_key_element(3, int.clone());
+                let value = NestedField::map_value_element(4, int.clone(), required);
+                Type::Map(MapType::new(Arc::new(key), Arc::new(value)))
+            },
+        );
+    }
 
     #[test]
     fn test_schema_validation_with_metadata_differences() {
