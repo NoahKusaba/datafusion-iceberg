@@ -778,17 +778,17 @@ mod tests {
         assert!(err.contains(INCOMPATIBLE), "{err}");
     }
 
-    /// Checks the nullability rule for a nested field: `input(nullable)` has a
-    /// required `id` and a column `c` whose nested int is `nullable`, and
-    /// `nested_table(required)` has the matching table column.
+    /// Checks the nullability rule for a nested field: the input has a required
+    /// `id` and a column `c` of type `input_type(nullable)`, whose nested int is
+    /// `nullable`, and `nested_table(required)` has the matching table column.
     fn assert_nested_nullability(
-        input: impl Fn(bool) -> DataType,
+        input_type: impl Fn(bool) -> DataType,
         nested_table: impl Fn(bool) -> Type,
     ) {
         let input = |nullable| {
             input_of(vec![
                 Field::new("id", DataType::Int32, false),
-                Field::new("c", input(nullable), false),
+                Field::new("c", input_type(nullable), false),
             ])
         };
         let table = |required| {
