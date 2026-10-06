@@ -23,10 +23,10 @@ use std::sync::Arc;
 use std::vec;
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
-use datafusion::arrow::compute::cast;
-use datafusion::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
-use datafusion::arrow::datatypes::Int64Type;
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use datafusion::arrow::compute::{
+    cast, concat_batches, sort_to_indices, take_record_batch,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -1012,6 +1012,17 @@ async fn run(
     Ok(pretty_format_batches(&run_batches(plan, ctx).await?)?.to_string())
 }
 
+/// Rebuilds `scan` from its accessors alone, as a codec would.
+fn rebuild_scan(scan: &IcebergTableScan) -> IcebergTableScan {
+    IcebergTableScan::new_with_predicate(
+        scan.table().clone(),
+        scan.snapshot_id(),
+        scan.schema(),
+        scan.predicates().cloned(),
+        scan.limit(),
+    )
+}
+
 /// Returns the first node of type `T` in `plan`, depth first.
 fn find_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> Option<&T> {
     plan.downcast_ref::<T>()
@@ -1116,13 +1127,7 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         scan.predicates().map(ToString::to_string).as_deref(),
         Some("foo1 = 1")
     );
-    let rebuilt = IcebergTableScan::new_with_predicate(
-        scan.table().clone(),
-        scan.snapshot_id(),
-        scan.schema(),
-        scan.predicates().cloned(),
-        scan.limit(),
-    );
+    let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run(scan, &ctx).await?;
@@ -1139,17 +1144,8 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     // is kept.
     let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
     let scan = plan.downcast_ref::<IcebergTableScan>().expect("a scan");
-    assert_eq!(
-        scan.projection(),
-        Some(&["foo1".to_string(), "foo2".to_string()][..])
-    );
-    let rebuilt = IcebergTableScan::new_with_predicate(
-        scan.table().clone(),
-        scan.snapshot_id(),
-        scan.schema(),
-        scan.predicates().cloned(),
-        scan.limit(),
-    );
+    assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
+    let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.limit(), Some(1));
     let expected = run(scan, &ctx).await?;
     expect![[r#"

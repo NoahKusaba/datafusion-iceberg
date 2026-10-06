@@ -84,7 +84,7 @@ impl IcebergTableScan {
     /// cannot be converted back to the filters it came from.
     ///
     /// Each argument takes what the matching accessor returns (`schema` what
-    /// [`ExecutionPlan::schema`] does, and `predicate` what
+    /// [`ExecutionPlan::schema`] does, and `predicates` what
     /// [`Self::predicates`] does):
     ///
     /// - `snapshot_id`: the snapshot to read, or `None` for the table's current
@@ -92,7 +92,7 @@ impl IcebergTableScan {
     /// - `schema`: the Arrow schema the scan outputs. The scan reads the
     ///   columns of the same names from the snapshot it scans, and no others.
     ///   A name that snapshot's schema lacks fails the scan when it runs.
-    /// - `predicate`: pushed down to Iceberg to skip data files and rows. The
+    /// - `predicates`: pushed down to Iceberg to skip data files and rows. The
     ///   table providers report their filters as
     ///   [`Inexact`](datafusion::logical_expr::TableProviderFilterPushDown::Inexact),
     ///   so DataFusion still applies them above the scan.
@@ -157,7 +157,7 @@ impl IcebergTableScan {
         table: Table,
         snapshot_id: Option<i64>,
         schema: ArrowSchemaRef,
-        predicate: Option<Predicate>,
+        predicates: Option<Predicate>,
         limit: Option<usize>,
     ) -> Self {
         // Reading the columns by name, rather than all of them, keeps the
@@ -174,7 +174,7 @@ impl IcebergTableScan {
             snapshot_id,
             plan_properties,
             projection,
-            predicates: predicate,
+            predicates,
             limit,
         }
     }
@@ -188,9 +188,9 @@ impl IcebergTableScan {
     }
 
     /// The names of the columns the scan reads, which are the fields of its
-    /// schema. Always `Some`.
-    pub fn projection(&self) -> Option<&[String]> {
-        Some(&self.projection)
+    /// schema.
+    pub fn projection(&self) -> &[String] {
+        &self.projection
     }
 
     pub fn predicates(&self) -> Option<&Predicate> {
