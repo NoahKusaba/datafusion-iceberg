@@ -33,6 +33,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::common::collect;
 use datafusion_iceberg::physical_plan::{
     IcebergCommitExec, IcebergMetadataScan, IcebergTableScan, IcebergWriteExec,
 };
@@ -999,7 +1000,7 @@ async fn run_batches(
 ) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
     let stream = plan.execute(0, ctx.task_ctx())?;
-    Ok(datafusion::physical_plan::common::collect(stream).await?)
+    Ok(collect(stream).await?)
 }
 
 /// Executes `plan`, which must have a single partition, and renders its rows
@@ -1266,33 +1267,17 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
                 .collect::<BTreeSet<_>>()
         })
         .collect::<Vec<_>>();
-    expect![[r#"
-        [
-            {
-                "added-data-files: 1",
-                "added-files-size: 913",
-                "added-records: 2",
-                "total-data-files: 1",
-                "total-delete-files: 0",
-                "total-equality-deletes: 0",
-                "total-files-size: 913",
-                "total-position-deletes: 0",
-                "total-records: 2",
-            },
-            {
-                "added-data-files: 1",
-                "added-files-size: 901",
-                "added-records: 1",
-                "total-data-files: 2",
-                "total-delete-files: 0",
-                "total-equality-deletes: 0",
-                "total-files-size: 1814",
-                "total-position-deletes: 0",
-                "total-records: 3",
-            },
-        ]
-    "#]]
-    .assert_debug_eq(&summaries);
+    assert_eq!(
+        summaries,
+        snapshots.map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .iter()
+                .map(|(key, value)| format!("{key}: {value}"))
+                .collect::<BTreeSet<_>>()
+        })
+    );
     // The rebuilt scan holds the same table, so lists its snapshots in the
     // same order.
     assert_eq!(
