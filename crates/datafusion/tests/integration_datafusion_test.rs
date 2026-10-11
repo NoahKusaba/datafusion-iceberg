@@ -43,19 +43,50 @@ use datafusion_iceberg::write::{IcebergCommitExec, IcebergWriteExec};
 use datafusion_iceberg::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
-use expect_test::expect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
     NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
 };
-use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
 };
 use tempfile::TempDir;
+
+/// Renders `batches` as their schema's fields and their columns, one per line,
+/// sorted by `sort_column` and with the columns in `ignore` skipped.
+fn format_record_batches(
+    batches: &[RecordBatch],
+    ignore: &[&str],
+    sort_column: Option<&str>,
+) -> (String, String) {
+    let batch = concat_batches(&batches[0].schema(), batches).unwrap();
+    let batch = match sort_column {
+        Some(name) => {
+            let order =
+                sort_to_indices(batch.column_by_name(name).unwrap(), None, None).unwrap();
+            take_record_batch(&batch, &order).unwrap()
+        }
+        None => batch,
+    };
+    let schema = batch.schema();
+    let fields: Vec<String> = schema.fields().iter().map(|f| f.to_string()).collect();
+    let columns: Vec<String> = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if ignore.contains(&field.name().as_str()) {
+                format!("{}: (skipped)", field.name())
+            } else {
+                format!("{}: {column:?}", field.name())
+            }
+        })
+        .collect();
+    (fields.join(",\n"), columns.join(",\n"))
+}
 
 fn temp_path() -> String {
     let temp_dir = TempDir::new().unwrap();
@@ -192,15 +223,14 @@ async fn test_provider_list_table_names() -> Result<(), Box<dyn Error>> {
 
     let result = schema.table_names();
 
-    expect![[r#"
-        [
-            "my_table",
-            "my_table$snapshots",
-            "my_table$manifests",
-            "my_table$history",
-        ]
-    "#]]
-    .assert_debug_eq(&result);
+    insta::assert_debug_snapshot!(result, @r#"
+    [
+        "my_table",
+        "my_table$snapshots",
+        "my_table$manifests",
+        "my_table$history",
+    ]
+    "#);
 
     Ok(())
 }
@@ -377,37 +407,33 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    check_record_batches(
-        snapshots,
-        expect![[r#"
-            Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
-            Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
-            Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
-            Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
-            Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
-            Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
-        expect![[r#"
-            committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
-            [
-            ],
-            snapshot_id: PrimitiveArray<Int64>
-            [
-            ],
-            parent_id: PrimitiveArray<Int64>
-            [
-            ],
-            operation: StringArray
-            [
-            ],
-            manifest_list: StringArray
-            [
-            ],
-            summary: MapArray
-            [
-            ]"#]],
-        &[],
-        None,
-    );
+    let (schema, data) = format_record_batches(&snapshots, &[], None);
+    insta::assert_snapshot!(schema, @r#"
+    Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+    Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
+    Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
+    Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
+    Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
+    Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+    [
+    ],
+    snapshot_id: PrimitiveArray<Int64>
+    [
+    ],
+    parent_id: PrimitiveArray<Int64>
+    [
+    ],
+    operation: StringArray
+    [
+    ],
+    manifest_list: StringArray
+    [
+    ],
+    summary: MapArray
+    [
+    ]"#);
 
     let manifests = ctx
         .sql("select * from catalog.ns.t1$manifests")
@@ -416,61 +442,57 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    check_record_batches(
-        manifests,
-        expect![[r#"
-            Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
-            Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
-            Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
-            Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
-            Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
-            Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} },
-            Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} },
-            Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} },
-            Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
-            Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
-            Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
-            Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
-        expect![[r#"
-            content: PrimitiveArray<Int32>
-            [
-            ],
-            path: StringArray
-            [
-            ],
-            length: PrimitiveArray<Int64>
-            [
-            ],
-            partition_spec_id: PrimitiveArray<Int32>
-            [
-            ],
-            added_snapshot_id: PrimitiveArray<Int64>
-            [
-            ],
-            added_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            existing_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            deleted_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            added_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            existing_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            deleted_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            partition_summaries: ListArray
-            [
-            ]"#]],
-        &[],
-        None,
-    );
+    let (schema, data) = format_record_batches(&manifests, &[], None);
+    insta::assert_snapshot!(schema, @r#"
+    Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
+    Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
+    Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
+    Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
+    Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
+    Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} },
+    Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} },
+    Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} },
+    Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
+    Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
+    Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
+    Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    content: PrimitiveArray<Int32>
+    [
+    ],
+    path: StringArray
+    [
+    ],
+    length: PrimitiveArray<Int64>
+    [
+    ],
+    partition_spec_id: PrimitiveArray<Int32>
+    [
+    ],
+    added_snapshot_id: PrimitiveArray<Int64>
+    [
+    ],
+    added_data_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    existing_data_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    deleted_data_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    added_delete_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    existing_delete_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    deleted_delete_files_count: PrimitiveArray<Int32>
+    [
+    ],
+    partition_summaries: ListArray
+    [
+    ]"#);
 
     Ok(())
 }
@@ -534,25 +556,21 @@ async fn test_insert_into() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Use check_record_batches to verify the data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
-        expect![[r#"
-            foo1: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            foo2: StringArray
-            [
-              "alan",
-              "turing",
-            ]"#]],
-        &[],
-        Some("foo1"),
-    );
+    let (schema, data) = format_record_batches(&batches, &[], Some("foo1"));
+    insta::assert_snapshot!(schema, @r#"
+    Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
+    Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    foo1: PrimitiveArray<Int32>
+    [
+      1,
+      2,
+    ],
+    foo2: StringArray
+    [
+      "alan",
+      "turing",
+    ]"#);
 
     Ok(())
 }
@@ -707,82 +725,78 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Use check_record_batches to verify the data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            name: StringArray
-            [
-              "Alice",
-              "Bob",
-            ],
-            profile: StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
-            StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "street" (Utf8)
-            StringArray
-            [
-              "123 Main St",
-              "456 Market St",
-            ]
-            -- child 1: "city" (Utf8)
-            StringArray
-            [
-              "San Francisco",
-              "San Jose",
-            ]
-            -- child 2: "zip" (Int32)
-            PrimitiveArray<Int32>
-            [
-              94105,
-              95113,
-            ]
-            ]
-            -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
-            StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "email" (Utf8)
-            StringArray
-            [
-              "alice@example.com",
-              "bob@example.com",
-            ]
-            -- child 1: "phone" (Utf8)
-            StringArray
-            [
-              "555-1234",
-              null,
-            ]
-            ]
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    let (schema, data) = format_record_batches(&batches, &[], Some("id"));
+    insta::assert_snapshot!(schema, @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+    Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
+    Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    id: PrimitiveArray<Int32>
+    [
+      1,
+      2,
+    ],
+    name: StringArray
+    [
+      "Alice",
+      "Bob",
+    ],
+    profile: StructArray
+    -- validity:
+    [
+      valid,
+      valid,
+    ]
+    [
+    -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
+    StructArray
+    -- validity:
+    [
+      valid,
+      valid,
+    ]
+    [
+    -- child 0: "street" (Utf8)
+    StringArray
+    [
+      "123 Main St",
+      "456 Market St",
+    ]
+    -- child 1: "city" (Utf8)
+    StringArray
+    [
+      "San Francisco",
+      "San Jose",
+    ]
+    -- child 2: "zip" (Int32)
+    PrimitiveArray<Int32>
+    [
+      94105,
+      95113,
+    ]
+    ]
+    -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
+    StructArray
+    -- validity:
+    [
+      valid,
+      valid,
+    ]
+    [
+    -- child 0: "email" (Utf8)
+    StringArray
+    [
+      "alice@example.com",
+      "bob@example.com",
+    ]
+    -- child 1: "phone" (Utf8)
+    StringArray
+    [
+      "555-1234",
+      null,
+    ]
+    ]
+    ]"#);
 
     // Query with explicit field access to verify nested data
     let df = ctx
@@ -806,55 +820,51 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Use check_record_batches to verify the flattened data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            name: StringArray
-            [
-              "Alice",
-              "Bob",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][street]: StringArray
-            [
-              "123 Main St",
-              "456 Market St",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][city]: StringArray
-            [
-              "San Francisco",
-              "San Jose",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][zip]: PrimitiveArray<Int32>
-            [
-              94105,
-              95113,
-            ],
-            catalog.test_insert_nested.nested_table.profile[contact][email]: StringArray
-            [
-              "alice@example.com",
-              "bob@example.com",
-            ],
-            catalog.test_insert_nested.nested_table.profile[contact][phone]: StringArray
-            [
-              "555-1234",
-              null,
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    let (schema, data) = format_record_batches(&batches, &[], Some("id"));
+    insta::assert_snapshot!(schema, @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+    Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
+    Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} },
+    Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} },
+    Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} },
+    Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} },
+    Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    id: PrimitiveArray<Int32>
+    [
+      1,
+      2,
+    ],
+    name: StringArray
+    [
+      "Alice",
+      "Bob",
+    ],
+    catalog.test_insert_nested.nested_table.profile[address][street]: StringArray
+    [
+      "123 Main St",
+      "456 Market St",
+    ],
+    catalog.test_insert_nested.nested_table.profile[address][city]: StringArray
+    [
+      "San Francisco",
+      "San Jose",
+    ],
+    catalog.test_insert_nested.nested_table.profile[address][zip]: PrimitiveArray<Int32>
+    [
+      94105,
+      95113,
+    ],
+    catalog.test_insert_nested.nested_table.profile[contact][email]: StringArray
+    [
+      "alice@example.com",
+      "bob@example.com",
+    ],
+    catalog.test_insert_nested.nested_table.profile[contact][phone]: StringArray
+    [
+      "555-1234",
+      null,
+    ]"#);
 
     Ok(())
 }
@@ -935,40 +945,36 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the data - note that _partition column should NOT be present
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-              3,
-              4,
-              5,
-            ],
-            category: StringArray
-            [
-              "electronics",
-              "electronics",
-              "books",
-              "books",
-              "clothing",
-            ],
-            value: StringArray
-            [
-              "laptop",
-              "phone",
-              "novel",
-              "textbook",
-              "shirt",
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    let (schema, data) = format_record_batches(&batches, &[], Some("id"));
+    insta::assert_snapshot!(schema, @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
+    Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
+    Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#);
+    insta::assert_snapshot!(data, @r#"
+    id: PrimitiveArray<Int32>
+    [
+      1,
+      2,
+      3,
+      4,
+      5,
+    ],
+    category: StringArray
+    [
+      "electronics",
+      "electronics",
+      "books",
+      "books",
+      "clothing",
+    ],
+    value: StringArray
+    [
+      "laptop",
+      "phone",
+      "novel",
+      "textbook",
+      "shirt",
+    ]"#);
 
     // Verify that data files exist under correct partition paths
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
@@ -1100,13 +1106,12 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         commit.catalog().clone(),
         Arc::new(CoalescePartitionsExec::new(rebuilt_write)),
     );
-    expect![[r#"
-        +-------+
-        | count |
-        +-------+
-        | 2     |
-        +-------+"#]]
-    .assert_eq(&run(&rebuilt_commit, &ctx).await?);
+    insta::assert_snapshot!(run(&rebuilt_commit, &ctx).await?, @r#"
+    +-------+
+    | count |
+    +-------+
+    | 2     |
+    +-------+"#);
 
     // Read path: a scan pinned to a snapshot, rebuilt from its accessors,
     // returns the same rows.
@@ -1148,13 +1153,12 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     assert_eq!(rebuilt.schema(), scan.schema());
     assert_eq!(rebuilt.projection(), scan.projection());
     let expected = run_source(scan, &ctx).await?;
-    expect![[r#"
-        +------+------+
-        | foo1 | foo2 |
-        +------+------+
-        | 1    | alan |
-        +------+------+"#]]
-    .assert_eq(&expected);
+    insta::assert_snapshot!(expected, @r#"
+    +------+------+
+    | foo1 | foo2 |
+    +------+------+
+    | 1    | alan |
+    +------+------+"#);
     assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
 
     // Without a projection the scan reads every column by name, and its limit
@@ -1171,13 +1175,12 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
     let rebuilt = rebuild_scan(scan);
     assert_eq!(rebuilt.fetch(), Some(1));
     let expected = run_source(scan, &ctx).await?;
-    expect![[r#"
-        +------+------+
-        | foo1 | foo2 |
-        +------+------+
-        | 1    | alan |
-        +------+------+"#]]
-    .assert_eq(&expected);
+    insta::assert_snapshot!(expected, @r#"
+    +------+------+
+    | foo1 | foo2 |
+    +------+------+
+    | 1    | alan |
+    +------+------+"#);
     assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
 
     // A scan reads the columns of its schema and no others, so one built over
@@ -1190,14 +1193,13 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         None,
         None,
     );
-    expect![[r#"
-        +--------+
-        | foo2   |
-        +--------+
-        | alan   |
-        | turing |
-        +--------+"#]]
-    .assert_eq(&run_source(&partial, &ctx).await?);
+    insta::assert_snapshot!(run_source(&partial, &ctx).await?, @r#"
+    +--------+
+    | foo2   |
+    +--------+
+    | alan   |
+    | turing |
+    +--------+"#);
 
     // Metadata tables: a scan rebuilt from a metadata scan's parts reads the
     // same rows.
@@ -1359,36 +1361,35 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         ident.name(),
     )
     .await?;
-    expect![[r#"
-        Schema {
-            fields: [
-                Field {
-                    name: "foo1",
-                    data_type: Int32,
-                    metadata: {
-                        "PARQUET:field_id": "1",
-                    },
+    insta::assert_debug_snapshot!(evolved.schema(), @r#"
+    Schema {
+        fields: [
+            Field {
+                name: "foo1",
+                data_type: Int32,
+                metadata: {
+                    "PARQUET:field_id": "1",
                 },
-                Field {
-                    name: "foo2",
-                    data_type: Utf8,
-                    metadata: {
-                        "PARQUET:field_id": "2",
-                    },
+            },
+            Field {
+                name: "foo2",
+                data_type: Utf8,
+                metadata: {
+                    "PARQUET:field_id": "2",
                 },
-                Field {
-                    name: "foo3",
-                    data_type: Int32,
-                    nullable: true,
-                    metadata: {
-                        "PARQUET:field_id": "3",
-                    },
+            },
+            Field {
+                name: "foo3",
+                data_type: Int32,
+                nullable: true,
+                metadata: {
+                    "PARQUET:field_id": "3",
                 },
-            ],
-            metadata: {},
-        }
-    "#]]
-    .assert_debug_eq(&evolved.schema());
+            },
+        ],
+        metadata: {},
+    }
+    "#);
     ctx.register_table("evolved", Arc::new(evolved))?;
     ctx.sql("INSERT INTO evolved VALUES (2, 'turing', 3)")
         .await?
@@ -1404,14 +1405,13 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
     let sorted = take_record_batch(&batch, &order)?;
-    expect![[r#"
-        +------+--------+
-        | foo1 | foo2   |
-        +------+--------+
-        | 1    | alan   |
-        | 2    | turing |
-        +------+--------+"#]]
-    .assert_eq(&pretty_format_batches(&[sorted])?.to_string());
+    insta::assert_snapshot!(pretty_format_batches(&[sorted])?.to_string(), @r#"
+    +------+--------+
+    | foo1 | foo2   |
+    +------+--------+
+    | 1    | alan   |
+    | 2    | turing |
+    +------+--------+"#);
 
     Ok(())
 }
