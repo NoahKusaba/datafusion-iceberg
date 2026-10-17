@@ -32,6 +32,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::MetadataTableType;
 use iceberg::spec::TableProperties;
+use iceberg::table::Table;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::error::to_datafusion_error;
@@ -49,6 +50,8 @@ use crate::write::sort::sort_by_partition;
 /// operation, ensuring you always see the latest table state. Use this when you need
 /// write operations or want to see the most up-to-date data.
 ///
+/// Its schema is fixed when the provider is built, from the table as loaded then.
+///
 /// For read-only access to a specific snapshot without catalog overhead, use
 /// [`IcebergStaticTableProvider`](super::IcebergStaticTableProvider) instead.
 #[derive(Debug, Clone)]
@@ -57,7 +60,9 @@ pub struct IcebergCatalogTableProvider {
     catalog: Arc<dyn Catalog>,
     /// The table identifier (namespace + name)
     table_ident: TableIdent,
-    /// A reference-counted arrow `Schema` (cached at construction)
+    /// The metadata file of the table version this provider was built from
+    metadata_location: Option<String>,
+    /// The arrow form of that table version's current schema
     schema: ArrowSchemaRef,
 }
 
@@ -72,20 +77,31 @@ impl IcebergCatalogTableProvider {
         name: impl Into<String>,
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
-
-        // Load table once to get initial schema
         let table = catalog
             .load_table(&table_ident)
             .await
             .map_err(to_datafusion_error)?;
+        Self::try_new_from_table(catalog, &table)
+    }
+
+    /// Creates a provider for `table` without contacting `catalog`.
+    ///
+    /// The provider's schema is `table`'s current schema. Scans and inserts
+    /// load the table from `catalog` by its identifier; nothing checks that
+    /// `table` came from `catalog`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table's schema can't be converted to Arrow.
+    pub fn try_new_from_table(catalog: Arc<dyn Catalog>, table: &Table) -> Result<Self> {
         let schema = Arc::new(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(to_datafusion_error)?,
         );
-
         Ok(IcebergCatalogTableProvider {
             catalog,
-            table_ident,
+            table_ident: table.identifier().clone(),
+            metadata_location: table.metadata_location().map(str::to_string),
             schema,
         })
     }
@@ -94,12 +110,7 @@ impl IcebergCatalogTableProvider {
         &self,
         r#type: MetadataTableType,
     ) -> Result<IcebergMetadataTableProvider> {
-        // Load fresh table metadata for metadata table access
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = self.load_table().await?;
         Ok(IcebergMetadataTableProvider::new(table, r#type))
     }
 
@@ -111,6 +122,19 @@ impl IcebergCatalogTableProvider {
     /// The identifier of the table this provider reads and writes.
     pub fn table_ident(&self) -> &TableIdent {
         &self.table_ident
+    }
+
+    /// The metadata file of the table version the provider's schema comes from.
+    pub fn metadata_location(&self) -> Option<&str> {
+        self.metadata_location.as_deref()
+    }
+
+    /// Loads fresh table metadata from the catalog.
+    async fn load_table(&self) -> Result<Table> {
+        self.catalog
+            .load_table(&self.table_ident)
+            .await
+            .map_err(to_datafusion_error)
     }
 }
 
@@ -131,12 +155,7 @@ impl TableProvider for IcebergCatalogTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Load fresh table metadata from catalog
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = self.load_table().await?;
 
         // Create scan with fresh metadata (always use current snapshot)
         let source = IcebergDataSource::builder(table, self.schema.clone())
@@ -167,12 +186,7 @@ impl TableProvider for IcebergCatalogTableProvider {
             );
         }
 
-        // Load fresh table metadata from catalog
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(to_datafusion_error)?;
+        let table = self.load_table().await?;
 
         let partition_spec = table.metadata().default_partition_spec();
 

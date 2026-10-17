@@ -65,7 +65,7 @@ Tests are self-contained (in-memory catalogs, temp dirs, checked-in metadata JSO
 
 ### Table providers (`table/`)
 
-- **`IcebergCatalogTableProvider`**: catalog-backed. It caches the Arrow schema at construction but reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
+- **`IcebergCatalogTableProvider`**: catalog-backed. Its schema is derived from a loaded `Table` when it's built, so the two can't disagree; `try_new_from_table` builds one without contacting the catalog, as a codec does. It reloads table metadata from the catalog on every `scan` and `insert_into`. INSERT supports append only.
 - **`IcebergStaticTableProvider`**: wraps a fixed `Table`, optionally pinned to a snapshot id for time travel. Read-only.
 - **`IcebergTableProviderFactory`**: handles `CREATE EXTERNAL TABLE t STORED AS ICEBERG LOCATION '<metadata.json>'` and produces a static provider. Bare names get the `default` namespace. Schema, partition, and order clauses are rejected.
 

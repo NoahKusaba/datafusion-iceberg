@@ -961,13 +961,16 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
         .expect("a catalog-backed provider");
     assert_eq!(provider.table_ident(), &ident);
     assert!(Arc::ptr_eq(provider.catalog(), &client));
-    let rebuilt = IcebergCatalogTableProvider::try_new(
+    let table = client.load_table(&ident).await?;
+    let rebuilt = IcebergCatalogTableProvider::try_new_from_table(
         provider.catalog().clone(),
-        provider.table_ident().namespace().clone(),
-        provider.table_ident().name(),
-    )
-    .await?;
+        &table,
+    )?;
     assert_eq!(rebuilt.table_ident(), &ident);
+    assert_eq!(
+        rebuilt.metadata_location(),
+        Some(table.metadata_location_result()?)
+    );
     assert_eq!(rebuilt.schema(), provider.schema());
 
     // Write path: a commit above a write, both holding the table, and the
@@ -1208,7 +1211,8 @@ async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
 /// A catalog-backed provider keeps the schema it was built with, but scans the
 /// table as it is now. After a column is added to the table and written to, a
 /// scan with no projection still returns only the provider's columns, matching
-/// its schema.
+/// its schema. So does a provider rebuilt from the original's table, as a codec
+/// rebuilds it.
 #[tokio::test]
 async fn test_scan_after_schema_evolution_reads_provider_columns()
 -> Result<(), Box<dyn Error>> {
@@ -1224,6 +1228,7 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
             .await?,
     );
+    let original = client.load_table(&ident).await?;
     let ctx = SessionContext::new();
     ctx.register_table("t", provider.clone())?;
     ctx.sql("INSERT INTO t VALUES (1, 'alan')")
@@ -1261,16 +1266,25 @@ async fn test_scan_after_schema_evolution_reads_provider_columns()
         .collect()
         .await?;
 
-    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
-    assert_eq!(plan.schema(), provider.schema());
-    // The rows come from two data files, which may be read in either order.
-    // They are joined under their own schema, not the plan's, so that a column
-    // the plan does not report would show.
-    let batches = run_batches(plan.as_ref(), &ctx).await?;
-    let batch = concat_batches(&batches[0].schema(), &batches)?;
-    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
-    let sorted = take_record_batch(&batch, &order)?;
-    insta::assert_snapshot!(&pretty_format_batches(&[sorted])?.to_string(), @r#"
+    let rebuilt =
+        IcebergCatalogTableProvider::try_new_from_table(client.clone(), &original)?;
+    assert_eq!(rebuilt.schema(), provider.schema());
+
+    let mut scanned = Vec::new();
+    for provider in [provider.as_ref(), &rebuilt] {
+        let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+        assert_eq!(plan.schema(), provider.schema());
+        // The rows come from two data files, which may be read in either order.
+        // They are joined under their own schema, not the plan's, so that a
+        // column the plan does not report would show.
+        let batches = run_batches(plan.as_ref(), &ctx).await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+        let sorted = take_record_batch(&batch, &order)?;
+        scanned.push(pretty_format_batches(&[sorted])?.to_string());
+    }
+    assert_eq!(scanned[1], scanned[0]);
+    insta::assert_snapshot!(&scanned[0], @r#"
         +------+--------+
         | foo1 | foo2   |
         +------+--------+
