@@ -89,7 +89,7 @@ input
 
 - **`TaskWriter`** picks one of three writers: `UnpartitionedWriter`; `FanoutWriter` (accepts unsorted input, keeps many files open); or `ClusteredWriter` (requires sorted input, which is why the sort step exists).
 - **Writer limits:** only Parquet is supported. The writer honors `write.parquet.*` table properties and table encryption. It matches columns by name, because DataFusion batches carry no field IDs.
-- **`PartitionExpr`** is public and retains its partition spec and table schema so that distributed engines can serialize them and rebuild the expression on workers with `try_new`. Its equality and hash are by value; don't go back to pointer equality.
+- **`PartitionExpr`** is public and retains its partition spec and table schema so that distributed engines can serialize them and rebuild the expression on workers with `try_new`. Its children are the top-level columns holding each partition field's source (it descends into structs itself, nulling values under a null parent), and it never reads the batch by position: `ProjectionPushdown` may merge it into a lower projection and only rewrites columns it can see. That is why the public `try_new` requires the sources: a codec passes the decoded children, and only `project_with_partition` may assume a table-shaped input (crate-private `try_new_over_table`). Its equality and hash are by value; don't go back to pointer equality.
 
 ### Errors
 
