@@ -406,12 +406,10 @@ impl std::fmt::Display for PartitionExpr {
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // Neither PartitionSpec nor Schema implements Hash, so hash their ids:
-        // equal expressions agree on both, and collisions fall through to eq. The
-        // sources are left out on purpose: equal expressions also have equal
-        // sources, so hashing the ids alone is enough, and expressions that differ
-        // only in their sources are told apart by eq.
+        // equal expressions agree on both, and collisions fall through to eq.
         self.partition_spec.spec_id().hash(state);
         self.table_schema.schema_id().hash(state);
+        self.sources.hash(state);
     }
 }
 
@@ -678,12 +676,12 @@ mod tests {
         let expr =
             PartitionExpr::try_new_over_table(partition_spec, table_schema).unwrap();
 
-        // Rebuild from deep copies and the children, as a codec would; cloning the
+        // Rebuild from deep copies, as a codec would after decoding; cloning the
         // Arcs instead would let a pointer-based impl pass.
         let rebuilt = PartitionExpr::try_new(
             Arc::new(expr.partition_spec().as_ref().clone()),
             Arc::new(expr.table_schema().as_ref().clone()),
-            expr.children().into_iter().cloned().collect(),
+            vec![Arc::new(Column::new("id", 0))],
         )
         .unwrap();
 
