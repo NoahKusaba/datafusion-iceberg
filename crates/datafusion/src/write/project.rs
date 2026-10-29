@@ -284,30 +284,31 @@ impl PartitionExpr {
 
 /// The position of each field from the top level of `schema` down to `source_id`.
 fn source_path(schema: &IcebergSchema, source_id: i32) -> Result<Vec<usize>> {
-    field_path(schema.as_struct(), source_id).ok_or_else(|| {
-        to_datafusion_error(Error::new(
+    let mut path = Vec::new();
+    if !push_field_path(schema.as_struct(), source_id, &mut path) {
+        return Err(to_datafusion_error(Error::new(
             ErrorKind::DataInvalid,
             format!("Partition source field {source_id} not found in table schema"),
-        ))
-    })
+        )));
+    }
+    Ok(path)
 }
 
-fn field_path(fields: &StructType, field_id: i32) -> Option<Vec<usize>> {
-    fields
-        .fields()
-        .iter()
-        .enumerate()
-        .find_map(|(index, field)| {
-            let mut path = if field.id == field_id {
-                vec![]
-            } else if let Type::Struct(nested) = field.field_type.as_ref() {
-                field_path(nested, field_id)?
-            } else {
-                return None;
-            };
-            path.insert(0, index);
-            Some(path)
-        })
+/// Appends the positions from `fields` down to `field_id` to `path`, returning
+/// whether the field was found. `path` is left as it was if not.
+fn push_field_path(fields: &StructType, field_id: i32, path: &mut Vec<usize>) -> bool {
+    fields.fields().iter().enumerate().any(|(index, field)| {
+        path.push(index);
+        let found = field.id == field_id
+            || matches!(
+                field.field_type.as_ref(),
+                Type::Struct(nested) if push_field_path(nested, field_id, path)
+            );
+        if !found {
+            path.pop();
+        }
+        found
+    })
 }
 
 fn check_source_count(fields: usize, sources: usize) -> Result<()> {
@@ -405,7 +406,10 @@ impl std::fmt::Display for PartitionExpr {
 impl std::hash::Hash for PartitionExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // Neither PartitionSpec nor Schema implements Hash, so hash their ids:
-        // equal expressions agree on both, and collisions fall through to eq.
+        // equal expressions agree on both, and collisions fall through to eq. The
+        // sources are left out on purpose: equal expressions also have equal
+        // sources, so hashing the ids alone is enough, and expressions that differ
+        // only in their sources are told apart by eq.
         self.partition_spec.spec_id().hash(state);
         self.table_schema.schema_id().hash(state);
     }
@@ -800,6 +804,22 @@ mod tests {
         // Same spec_id, different partition column: comparing only the ids that
         // Hash uses would wrongly call these equal.
         assert_ne!(expr(spec(7, "id")), expr(spec(7, "part")));
+    }
+
+    #[test]
+    fn test_partition_expr_differs_on_sources() {
+        // The same spec and schema reading `id` from a different input column, as
+        // after the optimizer moves the expression onto a reordered input. Equating
+        // the two would let DataFusion reuse one in place of the other.
+        let expr = partitioned_on_id();
+        let moved = PartitionExpr::try_new(
+            expr.partition_spec().clone(),
+            expr.table_schema().clone(),
+            vec![Arc::new(Column::new("id", 2))],
+        )
+        .unwrap();
+
+        assert_ne!(expr, moved);
     }
 
     #[test]
